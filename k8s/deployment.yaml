@@ -1,0 +1,68 @@
+# Build image from this repo root (directory quickpod/ at same level as Dockerfile):
+#   docker build -t your-registry/quickpod:v0.1 -f Dockerfile .
+#
+# Create secret (do not commit real keys):
+#   kubectl create secret generic runpod-api-key -n quickpod --from-literal=RUNPOD_API_KEY='...'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quickpod
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-spec
+  namespace: quickpod
+data:
+  cluster.yaml: |
+    name: nova-vllm
+    num_nodes: 1
+    reconcile_interval_seconds: 120
+    resources:
+      image: runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel
+      gpu: RTX4090
+      gpu_count: 1
+      replica_log_http: false
+      ports: [8000]
+      cloud_type: SECURE
+      zones: [US-IL-1]
+      container_disk_in_gb: 50
+    envs:
+      HF_MODEL_ID: google/gemma-4-E4B-it
+    setup: |
+      pip install vllm
+    run: |
+      python -c "import time; time.sleep(999999)"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quickpod
+  namespace: quickpod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quickpod
+  template:
+    metadata:
+      labels:
+        app: quickpod
+    spec:
+      containers:
+        - name: reconciler
+          image: your-registry/quickpod:v0.1
+          args: ["reconcile", "--spec", "/config/cluster.yaml"]
+          env:
+            - name: RUNPOD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: runpod-api-key
+                  key: RUNPOD_API_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          configMap:
+            name: cluster-spec

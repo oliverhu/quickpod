@@ -1,0 +1,87 @@
+# mTLS smoke: Caddy requires client cert; quickpod verifies server with same CA.
+# Certs: scripts/gen_mtls_certs.sh examples/mtls_smoke_certs
+# Run: uv run python scripts/smoke_e2e_proxy.py --spec examples/cluster_smoke_e2e_mtls.yaml --clean-start
+#
+# verify_server_hostname: false — RunPod maps public IPs; server.pem uses CN=localhost.
+#
+# Note: RunPod often has no capacity for compute_type CPU + gpuCount 0 (bootstrap) requests.
+# This example uses a small GPU (RTX 3090 × 1) so smoke can provision reliably; the mock API
+# does not need the GPU. For CPU-only, set compute_type: CPU, gpu_count: 0, bootstrap_gpu: …
+
+name: nova-smoke-proxy-mtls
+num_nodes: 1
+reconcile_interval_seconds: 60
+
+resources:
+  compute_type: GPU
+  image: python:3.11-slim-bookworm
+  gpu: RTX3090
+  gpu_count: 1
+  ports:
+    - 8888
+    - 8000
+  log_server_port: 8888
+  worker_api_port: 8000
+  worker_https: true
+  worker_tls_verify: true
+  managed_worker_tls: true
+  cloud_type: ALL
+  zones:
+    - US-IL-1
+    - US-TX-1
+    - US-CA-1
+    - US-DE-1
+    - US-WA-1
+  container_disk_in_gb: 25
+  mtls:
+    enabled: true
+    verify_server_hostname: false
+    ca_file: mtls_smoke_certs/ca.pem
+    client_cert_file: mtls_smoke_certs/client.crt
+    client_key_file: mtls_smoke_certs/client.key
+    server_cert_file: mtls_smoke_certs/server.pem
+    server_key_file: mtls_smoke_certs/server.key
+
+envs: {}
+
+setup: |
+  apt-get update -qq && apt-get install -y -qq curl ca-certificates || true
+
+run: |
+  python3 -u <<'QPMOCK'
+  import json
+  import pathlib
+  import socket
+  import socketserver
+  import http.server
+
+  def wid():
+      try:
+          return pathlib.Path("/etc/hostname").read_text().strip()
+      except OSError:
+          return socket.gethostname()
+
+  class H(http.server.BaseHTTPRequestHandler):
+      def log_message(self, *_args):
+          return
+
+      def do_GET(self):
+          p = self.path.split("?", 1)[0].rstrip("/")
+          if p != "/v1/models":
+              self.send_response(404)
+              self.end_headers()
+              return
+          payload = {
+              "object": "list",
+              "data": [{"id": wid(), "object": "model", "owned_by": "quickpod-smoke-mtls"}],
+          }
+          b = json.dumps(payload).encode()
+          self.send_response(200)
+          self.send_header("Content-Type", "application/json")
+          self.end_headers()
+          self.wfile.write(b)
+
+  socketserver.TCPServer.allow_reuse_address = True
+  with socketserver.ThreadingTCPServer(("127.0.0.1", 18000), H) as httpd:
+      httpd.serve_forever()
+  QPMOCK

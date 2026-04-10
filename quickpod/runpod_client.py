@@ -1,0 +1,355 @@
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import re
+import time
+
+import httpx
+import uuid
+from typing import Any
+
+import runpod
+from runpod.error import QueryError
+
+from quickpod.graphql_pod import deploy_gpu_pod
+from quickpod.managed_worker import build_container_startup_script
+from quickpod.spec import ClusterSpec
+from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
+
+logger = logging.getLogger(__name__)
+
+_ALIVE_STATUSES = frozenset(
+    {
+        "RUNNING",
+        "CREATED",
+        "QUEUED",
+        "PROVISIONING",
+        "STARTING",
+    }
+)
+_DEAD_STATUSES = frozenset({"EXITED", "TERMINATED", "STOPPED", "FAILED"})
+_READY_STATUSES = frozenset({"RUNNING"})
+
+
+def configure_api(api_key: str) -> None:
+    runpod.api_key = api_key
+
+
+def _compact(s: str) -> str:
+    """Lowercase and remove spaces so RTX4090 matches RunPod's 'RTX 4090'."""
+    return re.sub(r"\s+", "", s.lower())
+
+
+def resolve_gpu_type_id(gpu_substring: str, api_key: str | None = None) -> str:
+    """Return gpuTypes[].id where displayName or id matches substring (case/spacing insensitive)."""
+    data = runpod.get_gpus(api_key=api_key)
+    if isinstance(data, list):
+        types = data
+    elif isinstance(data, dict):
+        types = data.get("data", {}).get("gpuTypes", data.get("gpuTypes", []))
+    else:
+        types = []
+    if not isinstance(types, list):
+        types = []
+    needle = _compact(gpu_substring.strip())
+    if not needle:
+        raise ValueError("resources.gpu must not be empty")
+    candidates: list[dict[str, Any]] = []
+    for g in types:
+        dn = g.get("displayName") or ""
+        gid = g.get("id")
+        if not gid:
+            continue
+        if needle in _compact(dn) or needle in _compact(str(gid)):
+            candidates.append(g)
+    if not candidates:
+        raise ValueError(
+            f"No GPU type matching {gpu_substring!r}. "
+            "Try: python -m quickpod list-gpus"
+        )
+    for g in candidates:
+        if "4090" in _compact(g.get("displayName") or "") and "4090" in needle:
+            return g["id"]
+    return candidates[0]["id"]
+
+
+def resolve_gpu_type_id_for_spec(
+    spec: ClusterSpec, api_key: str | None = None
+) -> str:
+    """Return a RunPod ``gpuTypeId``. CPU workloads still require a type id with ``gpuCount: 0``."""
+    ct = (spec.resources.compute_type or "GPU").strip().upper()
+    if ct == "CPU":
+        return resolve_gpu_type_id(spec.resources.bootstrap_gpu, api_key=api_key)
+    return resolve_gpu_type_id(spec.resources.gpu, api_key=api_key)
+
+
+def ports_to_runpod_string(ports: list[int]) -> str:
+    parts = [f"{p}/tcp" for p in ports]
+    if 22 not in ports:
+        parts.append("22/tcp")
+    return ",".join(parts)
+
+
+def build_startup_env(spec: ClusterSpec) -> dict[str, str]:
+    script = build_container_startup_script(spec)
+    env = dict(spec.envs)
+    env["ORCH_B64"] = base64.b64encode(script.encode()).decode("ascii")
+    return env
+
+
+def pod_name_prefix(cluster_name: str) -> str:
+    return f"{cluster_name}-"
+
+
+def list_managed_pods(
+    cluster_name: str,
+    api_key: str | None = None,
+    *,
+    empty_retries: int = 2,
+) -> list[dict[str, Any]]:
+    """Pods whose name starts with ``{cluster_name}-``.
+
+    When the filtered list is empty, **re-fetches** from RunPod up to ``empty_retries`` times
+    with short backoff. The API occasionally returns an empty pod list transiently; retries avoid
+    false negatives in dashboards and smoke tests. Set ``empty_retries=0`` to disable.
+    """
+    prefix = pod_name_prefix(cluster_name)
+    delay = 0.22
+    last: list[dict[str, Any]] = []
+    for attempt in range(max(0, empty_retries) + 1):
+        pods = runpod.get_pods(api_key=api_key)
+        if not isinstance(pods, list):
+            pods = []
+        last = [p for p in pods if (p.get("name") or "").startswith(prefix)]
+        if last:
+            return last
+        if attempt < empty_retries:
+            time.sleep(delay)
+            delay = min(delay * 1.6, 1.0)
+    return last
+
+
+def count_alive_nodes(pods: list[dict[str, Any]]) -> int:
+    n = 0
+    for p in pods:
+        st = (p.get("desiredStatus") or "").upper()
+        if st in _DEAD_STATUSES:
+            continue
+        if st in _ALIVE_STATUSES or (st and st not in _DEAD_STATUSES):
+            n += 1
+    return n
+
+
+def count_ready_nodes(pods: list[dict[str, Any]]) -> int:
+    """Pods whose desiredStatus is RUNNING (workload should be up)."""
+    n = 0
+    for p in pods:
+        st = (p.get("desiredStatus") or "").upper()
+        if st in _READY_STATUSES:
+            n += 1
+    return n
+
+
+def public_http_endpoint(
+    pod: dict[str, Any], private_port: int
+) -> tuple[str, int] | None:
+    """Map container private_port to (public_ip, public_port) from pod runtime."""
+    rt = pod.get("runtime") or {}
+    ports = rt.get("ports")
+    if not isinstance(ports, list):
+        return None
+    for entry in ports:
+        if not isinstance(entry, dict):
+            continue
+        priv = entry.get("privatePort")
+        pub = entry.get("publicPort")
+        ip = entry.get("ip")
+        if priv is None or pub is None or not ip:
+            continue
+        try:
+            priv_i = int(priv)
+            pub_i = int(pub)
+        except (TypeError, ValueError):
+            continue
+        if priv_i == private_port:
+            return (str(ip), pub_i)
+    return None
+
+
+def fetch_replica_http_log(
+    pod: dict[str, Any],
+    private_port: int,
+    path: str = "/quickpod-log",
+    *,
+    use_https: bool | None = None,
+    tls_insecure: bool | None = None,
+    timeout_sec: float = 8.0,
+    spec: ClusterSpec | None = None,
+) -> str:
+    """GET http(s)://public_ip:public_port/path from a running pod (quickpod worker script)."""
+    ep = public_http_endpoint(pod, private_port)
+    if not ep:
+        return "(no public endpoint yet — pod may still be provisioning)\n"
+    host, port = ep
+    if use_https is None:
+        use_https = os.environ.get("QUICKPOD_REPLICA_USE_HTTPS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    if tls_insecure is None:
+        tls_insecure = os.environ.get("QUICKPOD_REPLICA_TLS_INSECURE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    url = f"{'https' if use_https else 'http'}://{host}:{port}{path}"
+    headers: dict[str, str] = {}
+    if (
+        spec is not None
+        and use_https
+        and spec.resources.managed_worker_tls
+    ):
+        headers["Host"] = f"localhost:{port}"
+    if spec is not None and spec.resources.mtls.enabled:
+        tls_kw = httpx_log_fetch_kwargs(spec)
+    else:
+        verify = True
+        if use_https and tls_insecure:
+            verify = False
+        tls_kw = {"verify": verify if use_https else True, "cert": None}
+    try:
+        with httpx.Client(
+            timeout=timeout_sec,
+            http2=False,
+            trust_env=False,
+            headers=headers,
+            **tls_kw,
+        ) as c:
+            req = c.build_request("GET", url)
+            ex = httpx_worker_tls_extensions(spec) if spec is not None else {}
+            if ex:
+                req.extensions = {**dict(req.extensions), **ex}
+            r = c.send(req)
+        if r.status_code != 200:
+            return f"(HTTP {r.status_code} from replica log endpoint)\n"
+        return r.text
+    except httpx.RequestError as e:
+        return f"(could not reach {url}: {e})\n"
+
+
+def terminate_managed_pods(cluster_name: str, api_key: str | None = None) -> list[str]:
+    """Terminate all pods whose name matches this cluster prefix. Returns terminated ids."""
+    import runpod
+
+    terminated: list[str] = []
+    for p in list_managed_pods(cluster_name, api_key=api_key):
+        pid = p.get("id")
+        if not pid:
+            continue
+        runpod.terminate_pod(pid)
+        terminated.append(str(pid))
+    return terminated
+
+
+def _try_deploy(
+    *,
+    name: str,
+    r,
+    gpu_type_id: str,
+    env: dict[str, str],
+    ports: str,
+    docker_args: str,
+    data_center_id: str | None,
+    api_key: str | None,
+) -> dict[str, Any]:
+    mvc = r.min_vcpu_count if r.min_vcpu_count is not None else 2
+    cpu = (r.compute_type or "GPU").strip().upper() == "CPU"
+    return deploy_gpu_pod(
+        name=name,
+        image_name=r.image,
+        gpu_type_id=gpu_type_id,
+        cloud_type=r.cloud_type,
+        support_public_ip=r.support_public_ip,
+        start_ssh=r.start_ssh,
+        data_center_id=data_center_id,
+        gpu_count=r.gpu_count,
+        container_disk_in_gb=r.container_disk_in_gb,
+        ports=ports,
+        env=env,
+        docker_args=docker_args,
+        min_vcpu_count=mvc,
+        cpu_workload=cpu,
+        api_key=api_key,
+    )
+
+
+def launch_one_node(
+    spec: ClusterSpec, gpu_type_id: str, api_key: str | None = None
+) -> dict[str, Any]:
+    r = spec.resources
+    suffix = uuid.uuid4().hex[:8]
+    name = f"{spec.name}-{suffix}"
+    env = build_startup_env(spec)
+    ports = ports_to_runpod_string(r.ports)
+    docker_args = 'bash -lc "echo $ORCH_B64 | base64 -d | bash"'
+
+    last_err: Exception | None = None
+    for data_center_id in r.zones:
+        logger.info(
+            "Creating pod %s compute=%s gpu_type_id=%s zone=%s ports=%s",
+            name,
+            (r.compute_type or "GPU").strip().upper(),
+            gpu_type_id,
+            data_center_id,
+            ports,
+        )
+        try:
+            return _try_deploy(
+                name=name,
+                r=r,
+                gpu_type_id=gpu_type_id,
+                env=env,
+                ports=ports,
+                docker_args=docker_args,
+                data_center_id=data_center_id,
+                api_key=api_key,
+            )
+        except QueryError as e:
+            msg = str(e).lower()
+            if "no longer any instances" in msg or "not available" in msg:
+                last_err = e
+                logger.warning("No capacity in %s, trying next zone: %s", data_center_id, e)
+                continue
+            raise
+
+    logger.info(
+        "Creating pod %s compute=%s gpu_type_id=%s zone=%s ports=%s",
+        name,
+        (r.compute_type or "GPU").strip().upper(),
+        gpu_type_id,
+        "AUTO (dataCenterId null)",
+        ports,
+    )
+    try:
+        return _try_deploy(
+            name=name,
+            r=r,
+            gpu_type_id=gpu_type_id,
+            env=env,
+            ports=ports,
+            docker_args=docker_args,
+            data_center_id=None,
+            api_key=api_key,
+        )
+    except QueryError as e:
+        last_err = e
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("launch_one_node: unreachable")
+
+
+def validate_credentials(api_key: str | None = None) -> None:
+    runpod.get_user(api_key=api_key)

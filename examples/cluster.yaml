@@ -1,0 +1,40 @@
+# Minimal RunPod cluster: quickpod injects Caddy (HTTPS) + /quickpod-log when managed_worker_tls is true.
+# Your API must listen on 127.0.0.1:18000 (see quickpod.managed_worker.loopback_api_port).
+
+name: nova-vllm
+num_nodes: 1
+reconcile_interval_seconds: 60
+
+resources:
+  image: runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel
+  gpu: RTX4090
+  gpu_count: 1
+  ports:
+    - 8888
+    - 8000
+  log_server_port: 8888
+  worker_api_port: 8000
+  worker_https: true
+  worker_tls_verify: false
+  managed_worker_tls: true
+  cloud_type: SECURE
+  zones:
+    - US-IL-1
+  container_disk_in_gb: 50
+
+envs:
+  HF_MODEL_ID: google/gemma-4-E4B-it
+
+setup: |
+  pip install --upgrade pip
+  pip install "vllm>=0.8.0"
+  pip install --upgrade "transformers>=5.5.0"
+  pip install hf_transfer
+
+run: |
+  export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+  exec python -m vllm.entrypoints.openai.api_server \
+    --model "${HF_MODEL_ID}" \
+    --host 127.0.0.1 \
+    --port 18000 \
+    --dtype auto

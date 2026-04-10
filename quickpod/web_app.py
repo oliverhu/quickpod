@@ -1,0 +1,418 @@
+"""HTTP dashboard + OpenAI/vLLM proxy (HTTPS to workers, round-robin)."""
+
+from __future__ import annotations
+
+import html
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.background import BackgroundTask
+from starlette.responses import Response
+
+from quickpod.runpod_client import (
+    count_alive_nodes,
+    count_ready_nodes,
+    fetch_replica_http_log,
+    list_managed_pods,
+)
+from quickpod.spec import ClusterSpec, replica_log_http_port
+from quickpod.worker_http import httpx_worker_client_kwargs, httpx_worker_tls_extensions
+from quickpod.worker_pool import WorkerRing, worker_base_urls
+
+_HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+    }
+)
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>quickpod — {cluster_name}</title>
+  <style>
+    :root {{
+      --bg: #0f1419;
+      --card: #1a2332;
+      --text: #e7eef7;
+      --muted: #8b9cb3;
+      --ok: #3ecf8e;
+      --warn: #f0c14d;
+      --border: #2d3a4d;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1.25rem 1.5rem 3rem;
+      line-height: 1.45;
+    }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; margin: 0 0 0.25rem; }}
+    .sub {{ color: var(--muted); font-size: 0.9rem; margin-bottom: 1.25rem; }}
+    .api-box {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      margin-bottom: 1.25rem;
+      font-size: 0.85rem;
+    }}
+    .api-box code {{ color: #9ad7ff; }}
+    .summary {{
+      display: flex; flex-wrap: wrap; gap: 1rem;
+      margin-bottom: 1.5rem;
+    }}
+    .pill {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.85rem 1.1rem;
+      min-width: 10rem;
+    }}
+    .pill strong {{ display: block; font-size: 1.5rem; font-weight: 700; }}
+    .pill span {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
+    .grid {{ display: grid; gap: 1rem; }}
+    @media (min-width: 720px) {{ .grid {{ grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }} }}
+    article {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }}
+    article header {{
+      padding: 0.65rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 0.9rem;
+      display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+    }}
+    .st-running {{ color: var(--ok); }}
+    .st-warn {{ color: var(--warn); }}
+    pre {{
+      margin: 0;
+      padding: 0.75rem 0.85rem;
+      font-size: 0.78rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 280px;
+      overflow: auto;
+      color: #c8d4e0;
+    }}
+    .meta {{ font-size: 0.75rem; color: var(--muted); padding: 0 0.85rem 0.65rem; }}
+    footer {{ margin-top: 2rem; font-size: 0.75rem; color: var(--muted); }}
+  </style>
+</head>
+<body data-desired="{num_nodes}">
+  <h1>Cluster <code>{cluster_name}</code></h1>
+  <p class="sub">Desired <strong>{num_nodes}</strong> replicas · <span id="update-hint">updating…</span></p>
+  <div class="api-box" id="api-proxy-hint">
+    <strong>OpenAI-compatible API</strong> (round-robin to RUNNING workers):<br/>
+    <code id="openai-base">…</code>
+  </div>
+  <div class="summary">
+    <div class="pill"><span>Ready (RUNNING)</span><strong id="stat-ready">{ready} / {num_nodes}</strong></div>
+    <div class="pill"><span>Alive (non-dead)</span><strong id="stat-alive">{alive} / {num_nodes}</strong></div>
+    <div class="pill"><span>Managed pods</span><strong id="stat-managed">{managed}</strong></div>
+  </div>
+  <div class="grid" id="replica-grid">
+    {replica_cards}
+  </div>
+  <footer>quickpod · <code>/api/cluster</code> · replica logs: {log_footer} · workers reached over HTTPS by this service only</footer>
+  <script>
+(function () {{
+  const desired = parseInt(document.body.getAttribute('data-desired') || '0', 10);
+  const hint = document.getElementById('update-hint');
+  const openaiEl = document.getElementById('openai-base');
+  openaiEl.textContent = location.origin + '/v1  (e.g. ' + location.origin + '/v1/models)';
+
+  function esc(s) {{
+    if (s === null || s === undefined) return '';
+    const d = document.createElement('div');
+    d.textContent = String(s);
+    return d.innerHTML;
+  }}
+
+  function render(data) {{
+    document.getElementById('stat-ready').textContent = data.ready + ' / ' + (data.desired ?? desired);
+    document.getElementById('stat-alive').textContent = data.alive + ' / ' + (data.desired ?? desired);
+    document.getElementById('stat-managed').textContent = String((data.replicas || []).length);
+
+    const grid = document.getElementById('replica-grid');
+    const reps = data.replicas || [];
+    if (!reps.length) {{
+      grid.innerHTML = '<p>No matching pods yet.</p>';
+      return;
+    }}
+    grid.innerHTML = reps.map(function (r) {{
+      const stCls = (r.status || '').toUpperCase() === 'RUNNING' ? 'st-running' : 'st-warn';
+      const ep = r.endpoint ? esc(r.endpoint) : esc(r.endpoint_note || '—');
+      const prev = esc((r.log_preview || '').slice(0, 4000));
+      return (
+        '<article>' +
+          '<header><span>' + esc(r.name) + '</span><span class="' + stCls + '">' + esc(r.status) + '</span></header>' +
+          '<div class="meta">id <code>' + esc(r.id) + '</code> · ' + ep + '</div>' +
+          '<pre>' + prev + '</pre>' +
+        '</article>'
+      );
+    }}).join('');
+  }}
+
+  async function refresh() {{
+    try {{
+      const res = await fetch('/api/cluster', {{ cache: 'no-store' }});
+      if (!res.ok) throw new Error(String(res.status));
+      render(await res.json());
+      const t = new Date().toLocaleTimeString();
+      hint.textContent = 'last update ' + t + ' · next in 5s';
+    }} catch (e) {{
+      hint.textContent = 'update failed (retry in 5s)';
+    }}
+  }}
+
+  document.addEventListener('DOMContentLoaded', function () {{
+    refresh();
+    setInterval(refresh, 5000);
+  }});
+}})();
+  </script>
+</body>
+</html>
+"""
+
+
+def build_app(spec: ClusterSpec, api_key: str) -> FastAPI:
+    http_port = replica_log_http_port(spec.resources)
+    log_footer = (
+        f"port {http_port} → GET /quickpod-log (via quickpod → worker HTTPS)"
+        if http_port is not None
+        else "disabled (<code>replica_log_http: false</code>)"
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.worker_ring = WorkerRing()
+        app.state.http = httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=60.0),
+            limits=httpx.Limits(max_keepalive_connections=32, max_connections=128),
+            **httpx_worker_client_kwargs(spec),
+        )
+        yield
+        await app.state.http.aclose()
+
+    app = FastAPI(title="quickpod", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    def _snapshot() -> dict[str, Any]:
+        pods = list_managed_pods(spec.name, api_key=api_key)
+        alive = count_alive_nodes(pods)
+        ready = count_ready_nodes(pods)
+        bases = worker_base_urls(spec, api_key, require_running=True)
+        return {
+            "cluster": spec.name,
+            "desired": spec.num_nodes,
+            "alive": alive,
+            "ready": ready,
+            "shortage_alive": max(0, spec.num_nodes - alive),
+            "shortage_ready": max(0, spec.num_nodes - ready),
+            "replicas": [_replica_view(spec, p, http_port) for p in pods],
+            "replica_log_http": http_port is not None,
+            "replica_log_port": http_port,
+            "openai_proxy_path": "/v1",
+            "worker_backends_ready": len(bases),
+            "worker_https": spec.resources.worker_https,
+        }
+
+    async def _proxy_v1(request: Request, path_fragment: str) -> Response:
+        bases = worker_base_urls(spec, api_key, require_running=True)
+        base = request.app.state.worker_ring.pick(bases)
+        if not base:
+            return JSONResponse(
+                {
+                    "detail": "No RUNNING workers with a mapped API port — check cluster and RunPod.",
+                    "cluster": spec.name,
+                },
+                status_code=503,
+            )
+        frag = path_fragment.lstrip("/")
+        target = f"{base}/v1/{frag}" if frag else f"{base}/v1"
+        q = request.url.query
+        if q:
+            target = f"{target}?{q}"
+
+        headers: dict[str, str] = {}
+        for k, v in request.headers.items():
+            if k.lower() in _HOP_BY_HOP:
+                continue
+            headers[k] = v
+        if spec.resources.managed_worker_tls and spec.resources.worker_https:
+            try:
+                bu = httpx.URL(base)
+                if bu.port is not None:
+                    headers["Host"] = f"localhost:{bu.port}"
+            except Exception:
+                pass
+
+        body = await request.body()
+        client: httpx.AsyncClient = request.app.state.http
+
+        try:
+            req = client.build_request(
+                request.method,
+                target,
+                headers=headers,
+                content=body if body else None,
+            )
+            ex = httpx_worker_tls_extensions(spec)
+            if ex:
+                req.extensions = {**dict(req.extensions), **ex}
+            resp = await client.send(req, stream=True)
+        except httpx.RequestError as e:
+            return JSONResponse(
+                {"detail": f"upstream request failed: {e!s}"},
+                status_code=502,
+            )
+
+        out_headers = {
+            k: v
+            for k, v in resp.headers.items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+
+        return StreamingResponse(
+            resp.aiter_raw(),
+            status_code=resp.status_code,
+            headers=dict(out_headers),
+            background=BackgroundTask(resp.aclose),
+        )
+
+    @app.api_route(
+        "/v1",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    )
+    async def proxy_v1_root(request: Request) -> Response:
+        return await _proxy_v1(request, "")
+
+    @app.api_route(
+        "/v1/{full_path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    )
+    async def proxy_v1_deep(request: Request, full_path: str) -> Response:
+        return await _proxy_v1(request, full_path)
+
+    @app.get("/api/cluster")
+    def api_cluster() -> JSONResponse:
+        return JSONResponse(_snapshot())
+
+    @app.get("/api/replicas/{pod_id}/log")
+    def api_replica_log(pod_id: str) -> PlainTextResponse:
+        pods = list_managed_pods(spec.name, api_key=api_key)
+        for p in pods:
+            if str(p.get("id")) == pod_id:
+                if http_port is None:
+                    return PlainTextResponse(
+                        "replica log HTTP disabled in spec (resources.replica_log_http: false)\n"
+                    )
+                text = fetch_replica_http_log(
+                    p,
+                    http_port,
+                    use_https=spec.resources.worker_https,
+                    tls_insecure=not spec.resources.worker_tls_verify,
+                    spec=spec,
+                )
+                return PlainTextResponse(text)
+        raise HTTPException(status_code=404, detail="pod not found")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> str:
+        snap = _snapshot()
+        cards: list[str] = []
+        for r in snap["replicas"]:
+            pid = html.escape(r["id"])
+            name = html.escape(r["name"])
+            st = html.escape(r["status"])
+            st_cls = "st-running" if r["status"].upper() == "RUNNING" else "st-warn"
+            ep_note = html.escape(r.get("endpoint_note") or "")
+            ep_raw = r.get("endpoint")
+            ep_disp = html.escape(ep_raw) if ep_raw else ep_note or "—"
+            log_preview = html.escape(r["log_preview"][:4000])
+            cards.append(
+                f"""<article>
+  <header><span>{name}</span><span class="{st_cls}">{st}</span></header>
+  <div class="meta">id <code>{pid}</code> · {ep_disp}</div>
+  <pre>{log_preview}</pre>
+</article>"""
+            )
+        return _DASHBOARD_HTML.format(
+            cluster_name=html.escape(spec.name),
+            num_nodes=spec.num_nodes,
+            ready=snap["ready"],
+            alive=snap["alive"],
+            managed=len(snap["replicas"]),
+            replica_cards="\n".join(cards) if cards else "<p>No matching pods yet.</p>",
+            log_footer=log_footer,
+        )
+
+    return app
+
+
+def _replica_view(
+    spec: ClusterSpec,
+    pod: dict[str, Any],
+    http_port: int | None,
+    *,
+    log_max: int = 12000,
+) -> dict[str, Any]:
+    pid = str(pod.get("id") or "")
+    name = str(pod.get("name") or "")
+    st = str(pod.get("desiredStatus") or "")
+    if http_port is None:
+        return {
+            "id": pid,
+            "name": name,
+            "status": st,
+            "endpoint": None,
+            "endpoint_note": "logs disabled in spec",
+            "log_preview": (
+                "(replica log fetch disabled in spec — set resources.replica_log_http: true)\n"
+            ),
+        }
+    use_https = spec.resources.worker_https
+    tls_insecure = not spec.resources.worker_tls_verify
+    preview = fetch_replica_http_log(
+        pod,
+        http_port,
+        use_https=use_https,
+        tls_insecure=tls_insecure,
+        spec=spec,
+    )
+    if len(preview) > log_max:
+        preview = preview[:log_max] + "\n…(truncated)…\n"
+    return {
+        "id": pid,
+        "name": name,
+        "status": st,
+        "endpoint": None,
+        "endpoint_note": "API: use this host /v1 only (not worker IPs)",
+        "log_preview": preview,
+    }

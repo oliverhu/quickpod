@@ -1,0 +1,76 @@
+# E2E / smoke: 1× GPU, tiny HTTP server on 8888 with /quickpod-log and /v1/models (no vLLM).
+# Used by scripts/smoke_e2e_proxy.py — terminates cluster when the script finishes (unless --keep-pods).
+
+name: nova-smoke-proxy
+num_nodes: 1
+reconcile_interval_seconds: 60
+
+resources:
+  image: runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel
+  gpu: RTX3090
+  gpu_count: 1
+  ports:
+    - 8888
+  worker_api_port: 8888
+  worker_https: false
+  worker_tls_verify: false
+  cloud_type: ALL
+  zones:
+    - US-IL-1
+    - US-TX-1
+    - US-CA-1
+    - US-DE-1
+    - US-WA-1
+  container_disk_in_gb: 20
+
+envs: {}
+
+setup: |
+  set -euo pipefail
+  mkdir -p /workspace
+  exec > >(tee -a /workspace/replica.log) 2>&1
+  nvidia-smi || true
+  echo "quickpod smoke setup finished"
+
+run: |
+  set -euo pipefail
+  {
+    echo 'import json'
+    echo 'import pathlib'
+    echo 'import socket'
+    echo 'import socketserver'
+    echo 'import http.server'
+    echo 'LOG = pathlib.Path("/workspace/replica.log")'
+    echo 'def _worker_id() -> str:'
+    echo '    try:'
+    echo '        return pathlib.Path("/etc/hostname").read_text().strip()'
+    echo '    except OSError:'
+    echo '        return socket.gethostname()'
+    echo 'class H(http.server.BaseHTTPRequestHandler):'
+    echo '    def log_message(self, *_args):'
+    echo '        return'
+    echo '    def do_GET(self):'
+    echo '        p = self.path.split("?", 1)[0].rstrip("/")'
+    echo '        if p == "/quickpod-log":'
+    echo '            body = LOG.read_bytes() if LOG.exists() else b"(no log file yet)\\n"'
+    echo '            self.send_response(200)'
+    echo '            self.send_header("Content-Type", "text/plain; charset=utf-8")'
+    echo '            self.end_headers()'
+    echo '            self.wfile.write(body)'
+    echo '            return'
+    echo '        if p == "/v1/models":'
+    echo '            mid = _worker_id()'
+    echo '            payload = {"object": "list", "data": [{"id": mid, "object": "model", "owned_by": "quickpod-smoke"}]}'
+    echo '            b = json.dumps(payload).encode("utf-8")'
+    echo '            self.send_response(200)'
+    echo '            self.send_header("Content-Type", "application/json")'
+    echo '            self.end_headers()'
+    echo '            self.wfile.write(b)'
+    echo '            return'
+    echo '        self.send_response(404)'
+    echo '        self.end_headers()'
+    echo 'socketserver.TCPServer.allow_reuse_address = True'
+    echo 'with socketserver.ThreadingTCPServer(("0.0.0.0", 8888), H) as httpd:'
+    echo '    httpd.serve_forever()'
+  } > /workspace/quickpod_http.py
+  python3 -u /workspace/quickpod_http.py
