@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -24,6 +25,15 @@ from quickpod.serve_daemon_mgmt import (
 )
 from quickpod.spec import ClusterSpec, load_spec
 from quickpod.web_app import build_app
+
+logger = logging.getLogger(__name__)
+
+
+def _external_path(request: Request, path: str) -> str:
+    """Path for ``href`` / redirects when the hub may sit behind ``root_path`` (reverse proxy)."""
+    root = (request.scope.get("root_path") or "").rstrip("/")
+    p = path if path.startswith("/") else f"/{path}"
+    return f"{root}{p}" if root else p
 
 
 def _resolve_spec_path_on_disk(
@@ -79,8 +89,11 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
     to_mount.sort(key=lambda t: len(t[2]), reverse=True)
     mounted_names = frozenset(t[0] for t in to_mount)
 
-    @app.get("/", response_class=HTMLResponse)
-    def hub_index() -> str:
+    @app.get("/", response_class=HTMLResponse, name="hub_index")
+    def hub_index(
+        request: Request,
+        error: Annotated[str | None, Query()] = None,
+    ) -> str:
         rows = list_clusters_live(api_key, database_url=database_url)
         daemons: dict[str, dict[str, Any]] = {
             d["cluster_name"]: d for d in list_serve_daemons(database_url=database_url)
@@ -108,7 +121,8 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
             )
             if name in mounted_names:
                 cluster_cell = (
-                    f'<a href="/c/{html.escape(name, quote=True)}/"><code>{html.escape(name)}</code></a>'
+                    f'<a href="{html.escape(_external_path(request, f"/c/{name}/"))}">'
+                    f"<code>{html.escape(name)}</code></a>"
                 )
             elif d:
                 base = f"http://{public_listen_host(str(d['host']))}:{d['port']}/"
@@ -121,6 +135,8 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
                     f'<code title="No YAML on disk for this cluster (or name mismatch). '
                     f'Run reconcile --spec … or serve --spec …, then restart the hub.">{html.escape(name)}</code>'
                 )
+            stop_url = str(request.url_for("hub_api_stop", cluster_name=name))
+            remove_url = str(request.url_for("hub_api_remove", cluster_name=name))
             body_rows.append(
                 "<tr>"
                 f"<td>{cluster_cell}</td>"
@@ -131,11 +147,11 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
                 f"<td><small>{spec_disp}</small></td>"
                 f'<td><small>{html.escape(proxy)}</small></td>'
                 '<td class="actions">'
-                f'<form method="post" action="/api/stop/{html.escape(name, quote=True)}" '
+                f'<form method="post" action="{html.escape(stop_url)}" '
                 'style="display:inline-block;margin-right:0.4rem" '
                 f"onsubmit='return confirm({json.dumps(msg_stop)});'>"
                 '<button type="submit">Stop</button></form>'
-                f'<form method="post" action="/api/remove/{html.escape(name, quote=True)}" '
+                f'<form method="post" action="{html.escape(remove_url)}" '
                 'style="display:inline-block" '
                 f"onsubmit='return confirm({json.dumps(msg_remove)});'>"
                 '<button type="submit" class="danger">Delete</button></form>'
@@ -147,6 +163,11 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
             if body_rows
             else '<tr><td colspan="8">No clusters in the store yet. Run <code>quickpod reconcile --spec …</code> or <code>quickpod serve --spec …</code>.</td></tr>'
         )
+        err_html = ""
+        if error:
+            err_html = (
+                f'<p style="color:#f0a0a8;margin:0 0 1rem;font-size:0.9rem">{html.escape(error)}</p>'
+            )
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -174,6 +195,7 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
 <body>
   <h1>quickpod clusters</h1>
   <p class="sub">From the local store + live RunPod. Embedded UI under <code>/c/&lt;name&gt;/</code> needs the YAML on disk (same path as <code>reconcile</code> / <code>serve</code>); otherwise use the <span class="muted">(serve)</span> link. Restart the hub after adding clusters or fixing paths.</p>
+  {err_html}
   <table>
     <thead>
       <tr>
@@ -187,15 +209,29 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
 </body>
 </html>"""
 
-    @app.post("/api/stop/{cluster_name}")
-    def api_stop(cluster_name: str) -> RedirectResponse:
-        stop_cluster_and_runpod(cluster_name, api_key, database_url=database_url)
-        return RedirectResponse(url="/", status_code=303)
+    @app.post("/api/stop/{cluster_name}", name="hub_api_stop")
+    def api_stop(request: Request, cluster_name: str) -> RedirectResponse:
+        try:
+            stop_cluster_and_runpod(cluster_name, api_key, database_url=database_url)
+        except Exception as e:
+            logger.exception("hub stop failed for %s", cluster_name)
+            u = request.url_for("hub_index").include_query_params(
+                error=f"Stop failed ({cluster_name}): {e}"
+            )
+            return RedirectResponse(url=str(u), status_code=303)
+        return RedirectResponse(url=str(request.url_for("hub_index")), status_code=303)
 
-    @app.post("/api/remove/{cluster_name}")
-    def api_remove(cluster_name: str) -> RedirectResponse:
-        remove_cluster_completely(cluster_name, api_key, database_url=database_url)
-        return RedirectResponse(url="/", status_code=303)
+    @app.post("/api/remove/{cluster_name}", name="hub_api_remove")
+    def api_remove(request: Request, cluster_name: str) -> RedirectResponse:
+        try:
+            remove_cluster_completely(cluster_name, api_key, database_url=database_url)
+        except Exception as e:
+            logger.exception("hub delete failed for %s", cluster_name)
+            u = request.url_for("hub_index").include_query_params(
+                error=f"Delete failed ({cluster_name}): {e}"
+            )
+            return RedirectResponse(url=str(u), status_code=303)
+        return RedirectResponse(url=str(request.url_for("hub_index")), status_code=303)
 
     for _name, spec, prefix in to_mount:
         app.mount(prefix, build_app(spec, api_key, public_path_prefix=prefix))
