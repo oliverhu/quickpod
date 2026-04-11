@@ -1,7 +1,7 @@
 """Inject Caddy + managed monitoring when ``replica_log_http`` is true.
 
 - **``secure_mode: true`` (mTLS):** user ``run`` binds the workload on **127.0.0.1:18000**; quickpod
-  adds Caddy on ``worker_api_port`` / ``log_server_port`` and a monitor on loopback **18888**
+  adds Caddy on ``worker_api_port`` / ``quickpod_service_port`` and a monitor on loopback **18888**
   (``GET /quickpod/logs``, ``GET /quickpod/system``, ``GET /quickpod/status``), using ``resources.mtls`` PEMs.
 - **``secure_mode: false``:** quickpod writes and starts the same monitor on **0.0.0.0:log_port**;
   your ``run`` must bind **only** ``worker_api_port`` (distinct from the log port).
@@ -31,11 +31,11 @@ def managed_worker_validate(resources: ResourcesSpec) -> None:
     if resources.replica_log_http:
         lp = replica_log_http_port(resources)
         if lp is None:
-            raise ValueError("replica_log_http enabled but no log_server_port / ports")
+            raise ValueError("replica_log_http enabled but no quickpod_service_port / ports")
         if lp == resources.worker_api_port:
             raise ValueError(
                 "secure_mode with replica_log_http requires distinct "
-                "log_server_port and worker_api_port (two Caddy listeners)"
+                "quickpod_service_port and worker_api_port (two Caddy listeners)"
             )
 
 
@@ -459,7 +459,7 @@ def managed_setup_block(resources: ResourcesSpec, health: HealthCheckSpec | None
         [
             "/usr/local/bin/caddy fmt --overwrite /workspace/Caddyfile",
             "/usr/local/bin/caddy validate --config /workspace/Caddyfile --adapter caddyfile",
-            'echo "quickpod: starting caddy (TLS on worker_api_port and log_server_port)"',
+            'echo "quickpod: starting caddy (TLS on worker_api_port and quickpod_service_port)"',
         ]
     )
 

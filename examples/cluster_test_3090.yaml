@@ -1,5 +1,5 @@
 # Short GPU smoke test: 1× RTX 3090, keeps pod alive (stop in RunPod UI when done).
-# Mock API on worker_api_port; quickpod injects /quickpod/logs + /quickpod/system on log_server_port.
+# Mock API on worker_api_port; quickpod injects /quickpod/logs + /quickpod/system on quickpod_service_port (random if omitted).
 
 name: nova-test-3090
 num_nodes: 1
@@ -10,9 +10,7 @@ resources:
   gpu: RTX3090
   gpu_count: 1
   ports:
-    - 8888
     - 8000
-  log_server_port: 8888
   worker_api_port: 8000
   cloud_type: ALL
   zones:

@@ -129,7 +129,7 @@ Or **Delete** from the hub. This terminates matching pods, stops the local serve
 
 ## Plain HTTP smoke (no mTLS)
 
-For a simpler HTTP-only mock on port 8888, see `examples/cluster_smoke_e2e.yaml`:
+For a simpler HTTP-only mock, see `examples/cluster_smoke_e2e.yaml`:
 
 ```bash
 uv run quickpod serve --spec examples/cluster_smoke_e2e.yaml
@@ -198,9 +198,11 @@ Optional TLS for the **control UI only**: `--ssl-certfile` / `--ssl-keyfile` (se
 | `name`                       | Cluster id; pods are named `{name}-{8 hex}`                                                                                                                                                                   |
 | `num_nodes`                  | Desired instance count                                                                                                                                                                                        |
 | `reconcile_interval_seconds` | Sleep between reconcile passes in a loop                                                                                                                                                                      |
-| `resources`                  | `image`, `gpu`, `gpu_count`, `ports`, `replica_log_http`, `log_server_port`, `worker_api_port`, `secure_mode`, `mtls` (if secure), optional `managed_log_file`, `cloud_type`, `zones`, `container_disk_in_gb` |
+| `resources`                  | `image`, `gpu`, `gpu_count`, `ports`, `replica_log_http`, `quickpod_service_port` (optional random default), `worker_api_port`, `secure_mode`, `mtls` (if secure), optional `managed_log_file`, `cloud_type`, `zones`, `container_disk_in_gb` |
 | `envs`                       | Env vars for the container (no `"` or newlines — RunPod GraphQL limit)                                                                                                                                        |
 | `setup` / `run`              | Startup scripts; see secure mode below                                                                                                                                                                        |
+
+Legacy YAML may still use `log_server_port`; it is read as `quickpod_service_port`.
 
 ## Secure Mode
 
@@ -210,7 +212,7 @@ Plain HTTP from quickpod to workers. Your `setup` / `run` run as-is; you bind se
 
 ### `secure_mode: true`
 
-mTLS + HTTPS on the worker. Reconcile injects Caddy, PEMs, and a small loopback server for `GET /quickpod-log`. Your `**run`** should start the app on `**127.0.0.1:18000**` only; do not bind `worker_api_port` yourself. Distinct `log_server_port` and `worker_api_port` are required when `replica_log_http` is enabled.
+mTLS + HTTPS on the worker. Reconcile injects Caddy, PEMs, and a small loopback server for `GET /quickpod/logs`. Your `**run`** should start the app on `**127.0.0.1:18000**` only; do not bind `worker_api_port` yourself. Distinct `quickpod_service_port` and `worker_api_port` are required when `replica_log_http` is enabled (or omit `quickpod_service_port` to auto-pick a random port).
 
 `resources.mtls`: inline PEMs or `*_file` paths relative to the YAML. Set `verify_server_hostname: false` when workers use public IPs and the cert CN is `localhost`.
 
@@ -219,9 +221,9 @@ Full vLLM-style example: `examples/cluster.yaml`. Certs: `scripts/gen_mtls_certs
 
 | Field              | Meaning (secure mode)                                              |
 | ------------------ | ------------------------------------------------------------------ |
-| `worker_api_port`  | Caddy TLS port; quickpod proxies `/v1` here                        |
-| `log_server_port`  | HTTPS for `/quickpod-log` (Caddy → log helper)                     |
-| `managed_log_file` | File tailed for `/quickpod-log` (default `/workspace/replica.log`) |
+| `worker_api_port`       | Caddy TLS port; quickpod proxies `/v1` here                                              |
+| `quickpod_service_port` | Caddy TLS for `/quickpod/logs` etc.; omit for a random port merged into `ports`         |
+| `managed_log_file`      | File tailed for `/quickpod/logs` (default `/workspace/replica.log`)                      |
 
 
 Clients use `http(s)://<quickpod-host>:<serve-port>/v1` — not raw worker IPs.

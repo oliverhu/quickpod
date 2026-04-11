@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import textwrap
 from pathlib import Path
 from typing import Any, Literal
@@ -82,22 +83,26 @@ class ResourcesSpec(BaseModel):
     replica_log_http: bool = Field(
         default=True,
         description=(
-            "If True, quickpod serve pulls replica monitoring from log_server_port and quickpod "
+            "If True, quickpod serve pulls replica monitoring from quickpod_service_port and quickpod "
             "injects the monitor in the container startup script (secure_mode or not): "
             "GET /quickpod/logs (plain text), GET /quickpod/system (JSON), GET /quickpod/status "
             "(lifecycle + optional health). Set False to skip injection and dashboard fetches."
         ),
     )
     ports: list[int] = Field(
-        default_factory=lambda: [8888, 8000],
-        description="Default includes 8888 for the monitoring sidecar and 8000 for typical APIs.",
-    )
-    log_server_port: int | None = Field(
-        default=8888,
+        default_factory=lambda: [8000],
         description=(
-            "Container port where a replica serves GET /quickpod/logs and /quickpod/system. "
-            "Must be listed in ports when replica_log_http is True. "
-            "If null, the first entry in ports is used."
+            "Container ports exposed by RunPod; must include worker_api_port. "
+            "When replica_log_http is true and quickpod_service_port is omitted, a random port is "
+            "chosen and merged into this list."
+        ),
+    )
+    quickpod_service_port: int | None = Field(
+        default=None,
+        description=(
+            "Container port for the quickpod sidecar (GET /quickpod/logs, /quickpod/system, /quickpod/status). "
+            "If omitted, a random port in 30000–49151 is chosen (not equal to worker_api_port) and merged "
+            "into resources.ports. If set, it is merged into ports when missing."
         ),
     )
     worker_api_port: int | None = Field(
@@ -135,11 +140,22 @@ class ResourcesSpec(BaseModel):
     support_public_ip: bool = True
     start_ssh: bool = True
 
+    @field_validator("quickpod_service_port")
+    @classmethod
+    def quickpod_port_range(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if not (1 <= v <= 65535):
+            raise ValueError("quickpod_service_port must be between 1 and 65535")
+        return v
+
     @model_validator(mode="before")
     @classmethod
     def reject_legacy_tls_keys(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
+        if "log_server_port" in data and "quickpod_service_port" not in data:
+            data = {**data, "quickpod_service_port": data.pop("log_server_port")}
         legacy = ("worker_https", "worker_tls_verify", "managed_worker_tls")
         bad = [k for k in legacy if k in data]
         if bad:
@@ -168,16 +184,17 @@ class ResourcesSpec(BaseModel):
         elif s.gpu_count < 1:
             raise ValueError("For compute_type GPU, gpu_count must be >= 1")
         if s.replica_log_http:
-            p = (
-                s.log_server_port
-                if s.log_server_port is not None
-                else (s.ports[0] if s.ports else None)
-            )
-            if p is not None and p not in s.ports:
+            wp = s.worker_api_port
+            qp = s.quickpod_service_port
+            ports_list = list(s.ports)
+            if qp is None:
+                qp = _allocate_quickpod_service_port(wp, ports_list)
+            if wp is not None and qp == wp:
                 raise ValueError(
-                    f"log server private port {p} must be in resources.ports "
-                    f"(or set replica_log_http: false to disable dashboard log fetch)"
+                    "replica_log_http requires distinct quickpod_service_port and worker_api_port"
                 )
+            ports_final = sorted(set(ports_list) | {qp})
+            s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
         if s.worker_api_port is not None and s.worker_api_port not in s.ports:
             raise ValueError(
                 f"worker_api_port {s.worker_api_port} must be in resources.ports"
@@ -186,15 +203,11 @@ class ResourcesSpec(BaseModel):
             if s.worker_api_port is None:
                 raise ValueError("secure_mode: true requires worker_api_port")
             if s.replica_log_http:
-                lp = (
-                    s.log_server_port
-                    if s.log_server_port is not None
-                    else (s.ports[0] if s.ports else None)
-                )
+                lp = s.quickpod_service_port
                 if lp is not None and lp == s.worker_api_port:
                     raise ValueError(
                         "secure_mode with replica_log_http requires distinct "
-                        "log_server_port and worker_api_port"
+                        "quickpod_service_port and worker_api_port"
                     )
             for name in (
                 "ca_pem",
@@ -227,12 +240,29 @@ class ResourcesSpec(BaseModel):
                 wp = s.worker_api_port
                 if lp is not None and wp is not None and lp == wp:
                     raise ValueError(
-                        "replica_log_http with secure_mode false requires distinct log and API "
-                        "ports: quickpod injects /quickpod/logs and /quickpod/system on the log "
-                        "port; bind your workload only on worker_api_port (see resources.ports, "
-                        "log_server_port, worker_api_port)."
+                        "replica_log_http with secure_mode false requires distinct quickpod and API "
+                        "ports: quickpod injects /quickpod/logs and /quickpod/system on "
+                        "quickpod_service_port; bind your workload only on worker_api_port (see "
+                        "resources.ports, quickpod_service_port, worker_api_port)."
                     )
         return s
+
+
+def _allocate_quickpod_service_port(
+    worker_api_port: int | None,
+    ports: list[int],
+) -> int:
+    """Pick a port in 30000–49151 not used by worker_api_port or listed ports."""
+    taken: set[int] = set(ports)
+    if worker_api_port is not None:
+        taken.add(worker_api_port)
+    for _ in range(512):
+        p = random.randint(30000, 49151)
+        if p not in taken:
+            return p
+    raise ValueError(
+        "Could not pick a random quickpod_service_port; set resources.quickpod_service_port explicitly."
+    )
 
 
 class HealthCheckSpec(BaseModel):
@@ -261,9 +291,10 @@ def replica_log_http_port(resources: ResourcesSpec) -> int | None:
     """Private port mapped for GET /quickpod/logs and /quickpod/system on replicas, or None."""
     if not resources.replica_log_http:
         return None
-    if resources.log_server_port is not None:
-        return resources.log_server_port
-    return resources.ports[0] if resources.ports else 8000
+    qp = resources.quickpod_service_port
+    if qp is None:
+        raise RuntimeError("ResourcesSpec.quickpod_service_port unset — validate the model first")
+    return qp
 
 
 class ClusterSpec(BaseModel):
