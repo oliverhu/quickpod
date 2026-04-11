@@ -1,5 +1,5 @@
 # Short GPU smoke test: 1× RTX 3090, keeps pod alive with sleep (stop in RunPod UI when done).
-# Exposes port 8888 with GET /quickpod-log (replica stdout captured in /workspace/replica.log) for the dashboard.
+# Exposes port 8888 with GET /quickpod-log and GET /v1/models (for OpenAI proxy smoke through quickpod serve / hub).
 
 name: nova-test-3090
 num_nodes: 1
@@ -12,8 +12,6 @@ resources:
   ports:
     - 8888
   worker_api_port: 8888
-  worker_https: false
-  worker_tls_verify: false
   # ALL = secure + community; more likely to find capacity.
   cloud_type: ALL
   zones:
@@ -37,21 +35,38 @@ run: |
   set -euo pipefail
   {
     echo 'import http.server'
+    echo 'import json'
     echo 'import pathlib'
+    echo 'import socket'
     echo 'import socketserver'
     echo 'LOG = pathlib.Path("/workspace/replica.log")'
+    echo 'def _wid():'
+    echo '    try:'
+    echo '        return pathlib.Path("/etc/hostname").read_text().strip()'
+    echo '    except OSError:'
+    echo '        return socket.gethostname()'
     echo 'class H(http.server.BaseHTTPRequestHandler):'
     echo '    def log_message(self, *_args):'
     echo '        return'
     echo '    def do_GET(self):'
     echo '        p = self.path.split("?", 1)[0].rstrip("/")'
-    echo '        if p != "/quickpod-log":'
-    echo '            self.send_response(404); self.end_headers(); return'
-    echo '        body = LOG.read_bytes() if LOG.exists() else b"(no log file yet)\\n"'
-    echo '        self.send_response(200)'
-    echo '        self.send_header("Content-Type", "text/plain; charset=utf-8")'
-    echo '        self.end_headers()'
-    echo '        self.wfile.write(body)'
+    echo '        if p == "/quickpod-log":'
+    echo '            body = LOG.read_bytes() if LOG.exists() else b"(no log file yet)\\n"'
+    echo '            self.send_response(200)'
+    echo '            self.send_header("Content-Type", "text/plain; charset=utf-8")'
+    echo '            self.end_headers()'
+    echo '            self.wfile.write(body)'
+    echo '            return'
+    echo '        if p == "/v1/models":'
+    echo '            mid = _wid()'
+    echo '            payload = {"object": "list", "data": [{"id": mid, "object": "model", "owned_by": "quickpod-test-3090"}]}'
+    echo '            b = json.dumps(payload).encode("utf-8")'
+    echo '            self.send_response(200)'
+    echo '            self.send_header("Content-Type", "application/json")'
+    echo '            self.end_headers()'
+    echo '            self.wfile.write(b)'
+    echo '            return'
+    echo '        self.send_response(404); self.end_headers()'
     echo 'socketserver.TCPServer.allow_reuse_address = True'
     echo 'with socketserver.ThreadingTCPServer(("0.0.0.0", 8888), H) as httpd:'
     echo '    httpd.serve_forever()'

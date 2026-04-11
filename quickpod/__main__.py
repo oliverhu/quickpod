@@ -6,28 +6,32 @@ import logging
 import os
 import sys
 
-from quickpod import secrets
-from quickpod.cluster_store import delete_cluster_record, list_clusters_live, resolve_database_url
+from quickpod.cluster_store import (
+    get_serve_daemon,
+    list_clusters_live,
+    resolve_database_url,
+    upsert_serve_launch_prefs,
+)
+from quickpod.graphql_gpus import fetch_gpu_types_with_pricing
+from quickpod.hub_app import run_hub
+from quickpod.runtime_env import require_runpod_api_key
 from quickpod.reconciler import reconcile_once, run_loop
 from quickpod.runpod_client import (
     configure_api,
     resolve_gpu_type_id_for_spec,
-    terminate_managed_pods,
+    resources_gpu_yaml_hint,
     validate_credentials,
+)
+from quickpod.serve_daemon_mgmt import (
+    pick_free_port,
+    refresh_cluster_serve,
+    remove_cluster_completely,
+    serve_public_base_url,
+    start_serve_daemon,
+    stop_cluster_and_runpod,
 )
 from quickpod.serve_runner import run_serve
 from quickpod.spec import load_spec
-
-
-def _api_key() -> str:
-    k = os.environ.get("RUNPOD_API_KEY") or secrets.RUNPOD_API_KEY
-    if not k or "REPLACE" in k:
-        print(
-            "Set RUNPOD_API_KEY or edit quickpod/secrets.py in this package (replace REPLACE_WITH_YOUR_RUNPOD_API_KEY).",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    return k
 
 
 def _print_clusters_table(rows: list[dict], *, database_url: str) -> None:
@@ -80,13 +84,19 @@ def main() -> None:
     v = sub.add_parser("validate", help="Verify API key and list GPU match")
     v.add_argument("--spec", type=str, default=None, help="Path to cluster YAML (optional)")
 
-    sub.add_parser("list-gpus", help="Print RunPod gpuTypes (id + displayName) as JSON")
+    sub.add_parser(
+        "list-gpus",
+        help="Print RunPod gpuTypes as JSON (id, resourcesGpu hint for YAML, memory, communityPrice)",
+    )
 
     r = sub.add_parser("reconcile", help="One reconcile pass or loop")
     r.add_argument("--spec", type=str, required=True, help="Path to cluster YAML")
     r.add_argument("--once", action="store_true", help="Single pass then exit")
 
-    s = sub.add_parser("serve", help="Web UI + optional background reconcile loop")
+    s = sub.add_parser(
+        "serve",
+        help="Reconcile once, then OpenAI proxy + per-cluster UI (detached daemon unless --foreground)",
+    )
     s.add_argument("--spec", type=str, required=True, help="Path to cluster YAML")
     s.add_argument(
         "--host",
@@ -94,7 +104,13 @@ def main() -> None:
         default="0.0.0.0",
         help="Bind address (use 127.0.0.1 for local-only)",
     )
-    s.add_argument("--port", type=int, default=8765, help="HTTP port")
+    s.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        metavar="N",
+        help="HTTP port (default: pick a random free port)",
+    )
     s.add_argument(
         "--ssl-certfile",
         type=str,
@@ -112,17 +128,23 @@ def main() -> None:
         action="store_true",
         help="Run reconcile loop in a background thread (same spec)",
     )
-
-    t = sub.add_parser(
-        "terminate-cluster",
-        help="Terminate all RunPod pods matching this cluster name prefix",
-    )
-    t.add_argument("--spec", type=str, required=True, help="Path to cluster YAML")
-    t.add_argument(
-        "--yes",
+    s.add_argument(
+        "--foreground",
         action="store_true",
-        help="Required to confirm termination",
+        help="Run in the foreground (default: start a background daemon and exit)",
     )
+
+    ui = sub.add_parser(
+        "ui",
+        help="Multi-cluster dashboard (reads DB + RunPod; cluster detail under /c/<name>/)",
+    )
+    ui.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Bind address (use 127.0.0.1 for local-only)",
+    )
+    ui.add_argument("--port", type=int, default=8780, help="HTTP port (default 8780)")
 
     clusters = sub.add_parser("clusters", help="Cluster metadata store")
     cs = clusters.add_subparsers(dest="clusters_cmd", required=True)
@@ -132,9 +154,43 @@ def main() -> None:
         action="store_true",
         help="Print JSON instead of a table",
     )
+    cs_stop = cs.add_parser(
+        "stop",
+        help="Terminate RunPod pods for a cluster and stop its local serve daemon",
+        aliases=["top"],
+    )
+    cs_stop.add_argument(
+        "cluster_name",
+        type=str,
+        help="Cluster name (YAML name / pod name prefix)",
+    )
+    cs_rm = cs.add_parser(
+        "remove",
+        help="Terminate RunPod pods, stop local serve, and delete cluster from local store",
+    )
+    cs_rm.add_argument(
+        "cluster_name",
+        type=str,
+        help="Cluster name (same as the YAML `name` field)",
+    )
+    cs_rm.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required to confirm removal (terminates pods on RunPod)",
+    )
+
+    ref = sub.add_parser(
+        "refresh",
+        help="Stop cluster (RunPod + local proxy) and restart serve using saved YAML path and options",
+    )
+    ref.add_argument(
+        "cluster_name",
+        type=str,
+        help="Cluster name (same as the YAML `name` field)",
+    )
 
     args = p.parse_args()
-    key = _api_key()
+    key = require_runpod_api_key()
     configure_api(key)
     db_url = resolve_database_url(args.database_url)
 
@@ -151,17 +207,22 @@ def main() -> None:
         return
 
     if args.cmd == "list-gpus":
-        import runpod
-
-        raw = runpod.get_gpus(api_key=key)
-        if isinstance(raw, list):
-            types = raw
-        elif isinstance(raw, dict):
-            types = raw.get("data", {}).get("gpuTypes", raw.get("gpuTypes", []))
-        else:
-            types = []
-        slim = [{"id": g.get("id"), "displayName": g.get("displayName")} for g in types or []]
-        print(json.dumps(slim, indent=2))
+        types = fetch_gpu_types_with_pricing(api_key=key)
+        out = []
+        for g in types:
+            dn = g.get("displayName")
+            out.append(
+                {
+                    "id": g.get("id"),
+                    "displayName": dn,
+                    "resourcesGpu": resources_gpu_yaml_hint(
+                        dn if isinstance(dn, str) else None
+                    ),
+                    "memoryInGb": g.get("memoryInGb"),
+                    "communityPrice": g.get("communityPrice"),
+                }
+            )
+        print(json.dumps(out, indent=2))
         return
 
     if args.cmd == "reconcile":
@@ -169,53 +230,113 @@ def main() -> None:
         spec = load_spec(args.spec)
         gpu_type_id = resolve_gpu_type_id_for_spec(spec, api_key=key)
         if args.once:
-            reconcile_once(
-                spec,
-                key,
-                gpu_type_id,
-                spec_path=spec_path_abs,
-                database_url=args.database_url,
-            )
+            try:
+                reconcile_once(
+                    spec,
+                    key,
+                    gpu_type_id,
+                    spec_path=spec_path_abs,
+                    database_url=args.database_url,
+                )
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(2)
         else:
-            run_loop(
-                spec,
-                key,
-                spec_path=spec_path_abs,
-                database_url=args.database_url,
-            )
+            try:
+                run_loop(
+                    spec,
+                    key,
+                    spec_path=spec_path_abs,
+                    database_url=args.database_url,
+                )
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(2)
         return
 
     if args.cmd == "serve":
         spec_path_abs = os.path.abspath(args.spec)
         spec = load_spec(args.spec)
-        run_serve(
-            spec,
+        port = args.port if args.port is not None else pick_free_port(args.host)
+        if args.foreground:
+            upsert_serve_launch_prefs(
+                spec.name,
+                spec_path=spec_path_abs,
+                host=args.host,
+                port=port,
+                reconcile=args.reconcile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_keyfile=args.ssl_keyfile,
+                database_url=args.database_url,
+            )
+            gpu_type_id = resolve_gpu_type_id_for_spec(spec, api_key=key)
+            try:
+                reconcile_once(
+                    spec,
+                    key,
+                    gpu_type_id,
+                    spec_path=spec_path_abs,
+                    database_url=args.database_url,
+                )
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(2)
+            run_serve(
+                spec,
+                key,
+                host=args.host,
+                port=port,
+                reconcile=args.reconcile,
+                spec_path=spec_path_abs,
+                database_url=args.database_url,
+                ssl_certfile=args.ssl_certfile,
+                ssl_keyfile=args.ssl_keyfile,
+            )
+        else:
+            try:
+                name, pid = start_serve_daemon(
+                    spec_path_abs,
+                    key,
+                    host=args.host,
+                    port=port,
+                    reconcile=args.reconcile,
+                    database_url=args.database_url,
+                    ssl_certfile=args.ssl_certfile,
+                    ssl_keyfile=args.ssl_keyfile,
+                )
+            except (RuntimeError, ValueError) as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(2)
+            base = serve_public_base_url(args.host, port)
+            print(f"Started serve daemon for {name!r} (pid {pid})")
+            print(f"  OpenAI base URL: {base}/v1")
+            print(f"  Cluster UI (direct): {base}/")
+            print("  Multi-cluster hub: quickpod ui   → then open /c/<cluster>/")
+        return
+
+    if args.cmd == "refresh":
+        try:
+            name, pid = refresh_cluster_serve(
+                args.cluster_name, key, database_url=args.database_url
+            )
+        except (RuntimeError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
+        row = get_serve_daemon(name, database_url=args.database_url)
+        base = serve_public_base_url(str(row["host"]), int(row["port"]))
+        print(f"Refreshed serve daemon for {name!r} (pid {pid})")
+        print(f"  OpenAI base URL: {base}/v1")
+        print(f"  Cluster UI (direct): {base}/")
+        return
+
+    if args.cmd == "ui":
+        run_hub(
             key,
             host=args.host,
             port=args.port,
-            reconcile=args.reconcile,
-            spec_path=spec_path_abs,
             database_url=args.database_url,
-            ssl_certfile=args.ssl_certfile,
-            ssl_keyfile=args.ssl_keyfile,
+            log_level="info",
         )
-        return
-
-    if args.cmd == "terminate-cluster":
-        if not args.yes:
-            print(
-                "Refusing to terminate without --yes (destroys matching pods on RunPod).",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        spec = load_spec(args.spec)
-        ids = terminate_managed_pods(spec.name, api_key=key)
-        print(f"Terminated {len(ids)} pod(s): {ids}")
-        try:
-            delete_cluster_record(spec.name, database_url=args.database_url)
-            print(f"Removed cluster {spec.name!r} from local store.")
-        except Exception as e:
-            logging.warning("Could not remove cluster from store: %s", e)
         return
 
     if args.cmd == "clusters" and args.clusters_cmd == "list":
@@ -231,6 +352,33 @@ def main() -> None:
             print(json.dumps(out, indent=2))
         else:
             _print_clusters_table(rows, database_url=db_url)
+        return
+
+    if args.cmd == "clusters" and getattr(args, "clusters_cmd", None) in ("stop", "top"):
+        had, ids = stop_cluster_and_runpod(
+            args.cluster_name, key, database_url=args.database_url
+        )
+        print(
+            f"Cluster {args.cluster_name!r}: stopped local proxy={had}, "
+            f"terminated {len(ids)} pod(s): {ids}"
+        )
+        return
+
+    if args.cmd == "clusters" and args.clusters_cmd == "remove":
+        if not args.yes:
+            print(
+                "Refusing to remove without --yes (terminates matching pods on RunPod and "
+                "deletes the cluster from the local store).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        name = args.cluster_name
+        _had, ids, deleted = remove_cluster_completely(
+            name, key, database_url=args.database_url
+        )
+        print(f"Terminated {len(ids)} pod(s): {ids}")
+        if deleted:
+            print(f"Removed cluster {name!r} from local store.")
         return
 
 

@@ -15,7 +15,7 @@ from quickpod.spec import ClusterSpec
 def httpx_worker_tls_extensions(spec: ClusterSpec) -> dict[str, Any]:
     """Per-request ``extensions`` for httpcore (TLS SNI) when workers use Caddy + ``CN=localhost`` on a public IP."""
     r = spec.resources
-    if r.managed_worker_tls and r.worker_https:
+    if r.secure_mode:
         return {"sni_hostname": "localhost"}
     return {}
 
@@ -33,7 +33,7 @@ def _mtls_verify_arg(ca_path: Path, verify_server_hostname: bool) -> ssl.SSLCont
 def httpx_worker_client_kwargs(spec: ClusterSpec) -> dict[str, Any]:
     """Arguments for ``httpx.AsyncClient`` / ``httpx.Client`` toward GPU workers."""
     r = spec.resources
-    if r.mtls.enabled:
+    if r.secure_mode:
         d = Path(tempfile.mkdtemp(prefix="quickpod-mtls-"))
 
         def _rm() -> None:
@@ -49,10 +49,7 @@ def httpx_worker_client_kwargs(spec: ClusterSpec) -> dict[str, Any]:
             "verify": _mtls_verify_arg(ca, r.mtls.verify_server_hostname),
             "cert": (str(d / "client.crt"), str(d / "client.key")),
         }
-    verify: bool = True
-    if r.worker_https and not r.worker_tls_verify:
-        verify = False
-    return {"verify": verify, "cert": None}
+    return {"verify": True, "cert": None}
 
 
 # One persistent dir for sync log fetches (same spec process as serve).
@@ -64,11 +61,8 @@ def httpx_log_fetch_kwargs(spec: ClusterSpec) -> dict[str, Any]:
     """Sync ``httpx.Client`` options for ``fetch_replica_http_log``."""
     global _mtls_log_dir, _mtls_log_key
     r = spec.resources
-    if not r.mtls.enabled:
-        verify = True
-        if r.worker_https and not r.worker_tls_verify:
-            verify = False
-        return {"verify": verify, "cert": None}
+    if not r.secure_mode:
+        return {"verify": True, "cert": None}
 
     key = r.mtls.fingerprint()
     if _mtls_log_dir is None or _mtls_log_key != key:

@@ -1,4 +1,5 @@
-# Minimal RunPod cluster: quickpod injects Caddy (HTTPS) + /quickpod-log when managed_worker_tls is true.
+# Minimal RunPod cluster with mTLS: quickpod injects Caddy + /quickpod-log when secure_mode is true.
+# Generate certs once: scripts/gen_mtls_certs.sh examples/mtls_smoke_certs
 # Your API must listen on 127.0.0.1:18000 (see quickpod.managed_worker.loopback_api_port).
 
 name: nova-vllm
@@ -14,13 +15,18 @@ resources:
     - 8000
   log_server_port: 8888
   worker_api_port: 8000
-  worker_https: true
-  worker_tls_verify: false
-  managed_worker_tls: true
+  secure_mode: true
   cloud_type: SECURE
   zones:
     - US-IL-1
   container_disk_in_gb: 50
+  mtls:
+    verify_server_hostname: false
+    ca_file: mtls_smoke_certs/ca.pem
+    client_cert_file: mtls_smoke_certs/client.crt
+    client_key_file: mtls_smoke_certs/client.key
+    server_cert_file: mtls_smoke_certs/server.pem
+    server_key_file: mtls_smoke_certs/server.key
 
 envs:
   HF_MODEL_ID: google/gemma-4-E4B-it

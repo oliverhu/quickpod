@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate a small CA plus server + client certs for quickpod resources.mtls (see README).
+# Generate a small CA plus server + client certs for quickpod resources.mtls when secure_mode is true (see README).
 # Usage: ./scripts/gen_mtls_certs.sh [output_dir]
 set -euo pipefail
 DIR="${1:-./mtls-certs}"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 from contextlib import asynccontextmanager
 from typing import Any
@@ -36,6 +37,18 @@ _HOP_BY_HOP = frozenset(
         "host",
     }
 )
+
+# Dashboard shows the tail of each log: entries append over time; the head is usually apt/setup.
+_LOG_PREVIEW_FETCH_MAX = 12000
+_LOG_PREVIEW_UI_MAX = 4000
+
+
+def _tail_for_preview(text: str, max_chars: int) -> str:
+    """Keep the end of a growing log so the UI shows the most recent lines."""
+    if len(text) <= max_chars:
+        return text
+    return "…(older log truncated)…\n" + text[-max_chars:]
+
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -117,7 +130,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     footer {{ margin-top: 2rem; font-size: 0.75rem; color: var(--muted); }}
   </style>
 </head>
-<body data-desired="{num_nodes}">
+<body data-desired="{num_nodes}" data-api-prefix="{api_prefix}">
   <h1>Cluster <code>{cluster_name}</code></h1>
   <p class="sub">Desired <strong>{num_nodes}</strong> replicas · <span id="update-hint">updating…</span></p>
   <div class="api-box" id="api-proxy-hint">
@@ -138,13 +151,33 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   const desired = parseInt(document.body.getAttribute('data-desired') || '0', 10);
   const hint = document.getElementById('update-hint');
   const openaiEl = document.getElementById('openai-base');
-  openaiEl.textContent = location.origin + '/v1  (e.g. ' + location.origin + '/v1/models)';
+  const apiPrefix = document.body.getAttribute('data-api-prefix') || '';
+  function qp(p) {{
+    if (!p.startsWith('/')) p = '/' + p;
+    if (!apiPrefix) return p;
+    return apiPrefix.replace(/\\/+$/, '') + p;
+  }}
+  openaiEl.textContent = location.origin + qp('/v1') + '  (e.g. ' + location.origin + qp('/v1/models') + ')';
 
   function esc(s) {{
     if (s === null || s === undefined) return '';
     const d = document.createElement('div');
     d.textContent = String(s);
     return d.innerHTML;
+  }}
+
+  function tailPreview(s, maxChars) {{
+    const t = String(s || '');
+    if (t.length <= maxChars) return t;
+    return '…(older log truncated)…\\n' + t.slice(-maxChars);
+  }}
+
+  function scrollReplicaLogsToBottom() {{
+    const grid = document.getElementById('replica-grid');
+    if (!grid) return;
+    grid.querySelectorAll('pre').forEach(function (el) {{
+      el.scrollTop = el.scrollHeight;
+    }});
   }}
 
   function render(data) {{
@@ -161,7 +194,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     grid.innerHTML = reps.map(function (r) {{
       const stCls = (r.status || '').toUpperCase() === 'RUNNING' ? 'st-running' : 'st-warn';
       const ep = r.endpoint ? esc(r.endpoint) : esc(r.endpoint_note || '—');
-      const prev = esc((r.log_preview || '').slice(0, 4000));
+      const prev = esc(tailPreview(r.log_preview, 4000));
       return (
         '<article>' +
           '<header><span>' + esc(r.name) + '</span><span class="' + stCls + '">' + esc(r.status) + '</span></header>' +
@@ -170,11 +203,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         '</article>'
       );
     }}).join('');
+    scrollReplicaLogsToBottom();
+    requestAnimationFrame(scrollReplicaLogsToBottom);
   }}
 
   async function refresh() {{
     try {{
-      const res = await fetch('/api/cluster', {{ cache: 'no-store' }});
+      const res = await fetch(qp('/api/cluster'), {{ cache: 'no-store' }});
       if (!res.ok) throw new Error(String(res.status));
       render(await res.json());
       const t = new Date().toLocaleTimeString();
@@ -185,6 +220,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   }}
 
   document.addEventListener('DOMContentLoaded', function () {{
+    scrollReplicaLogsToBottom();
     refresh();
     setInterval(refresh, 5000);
   }});
@@ -195,26 +231,47 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
-def build_app(spec: ClusterSpec, api_key: str) -> FastAPI:
+def build_app(
+    spec: ClusterSpec,
+    api_key: str,
+    *,
+    public_path_prefix: str = "",
+) -> FastAPI:
     http_port = replica_log_http_port(spec.resources)
     log_footer = (
-        f"port {http_port} → GET /quickpod-log (via quickpod → worker HTTPS)"
+        f"port {http_port} → GET /quickpod-log (via quickpod → worker "
+        f"{'HTTPS+mTLS' if spec.resources.secure_mode else 'HTTP'})"
         if http_port is not None
         else "disabled (<code>replica_log_http: false</code>)"
     )
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        app.state.worker_ring = WorkerRing()
-        app.state.http = httpx.AsyncClient(
+    def _init_proxy_state(a: FastAPI) -> None:
+        a.state.worker_ring = WorkerRing()
+        a.state.http = httpx.AsyncClient(
             timeout=httpx.Timeout(600.0, connect=60.0),
             limits=httpx.Limits(max_keepalive_connections=32, max_connections=128),
             **httpx_worker_client_kwargs(spec),
         )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Runs for standalone `quickpod serve`; **not** for apps mounted under `quickpod ui`.
+        _init_proxy_state(app)
         yield
         await app.state.http.aclose()
 
     app = FastAPI(title="quickpod", version="0.1.0", lifespan=lifespan)
+    _proxy_lock = asyncio.Lock()
+
+    @app.middleware("http")
+    async def ensure_proxy_state(request: Request, call_next):
+        # Mounted sub-apps do not receive lifespan events; lazily init httpx + worker ring.
+        if getattr(request.app.state, "http", None) is None:
+            async with _proxy_lock:
+                if getattr(request.app.state, "http", None) is None:
+                    _init_proxy_state(request.app)
+        return await call_next(request)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -240,7 +297,7 @@ def build_app(spec: ClusterSpec, api_key: str) -> FastAPI:
             "replica_log_port": http_port,
             "openai_proxy_path": "/v1",
             "worker_backends_ready": len(bases),
-            "worker_https": spec.resources.worker_https,
+            "secure_mode": spec.resources.secure_mode,
         }
 
     async def _proxy_v1(request: Request, path_fragment: str) -> Response:
@@ -265,7 +322,7 @@ def build_app(spec: ClusterSpec, api_key: str) -> FastAPI:
             if k.lower() in _HOP_BY_HOP:
                 continue
             headers[k] = v
-        if spec.resources.managed_worker_tls and spec.resources.worker_https:
+        if spec.resources.secure_mode:
             try:
                 bu = httpx.URL(base)
                 if bu.port is not None:
@@ -336,8 +393,8 @@ def build_app(spec: ClusterSpec, api_key: str) -> FastAPI:
                 text = fetch_replica_http_log(
                     p,
                     http_port,
-                    use_https=spec.resources.worker_https,
-                    tls_insecure=not spec.resources.worker_tls_verify,
+                    use_https=spec.resources.secure_mode,
+                    tls_insecure=False,
                     spec=spec,
                 )
                 return PlainTextResponse(text)
@@ -355,7 +412,9 @@ def build_app(spec: ClusterSpec, api_key: str) -> FastAPI:
             ep_note = html.escape(r.get("endpoint_note") or "")
             ep_raw = r.get("endpoint")
             ep_disp = html.escape(ep_raw) if ep_raw else ep_note or "—"
-            log_preview = html.escape(r["log_preview"][:4000])
+            log_preview = html.escape(
+                _tail_for_preview(r["log_preview"], _LOG_PREVIEW_UI_MAX)
+            )
             cards.append(
                 f"""<article>
   <header><span>{name}</span><span class="{st_cls}">{st}</span></header>
@@ -371,6 +430,7 @@ def build_app(spec: ClusterSpec, api_key: str) -> FastAPI:
             managed=len(snap["replicas"]),
             replica_cards="\n".join(cards) if cards else "<p>No matching pods yet.</p>",
             log_footer=log_footer,
+            api_prefix=html.escape(public_path_prefix or "", quote=True),
         )
 
     return app
@@ -381,7 +441,7 @@ def _replica_view(
     pod: dict[str, Any],
     http_port: int | None,
     *,
-    log_max: int = 12000,
+    log_max: int = _LOG_PREVIEW_FETCH_MAX,
 ) -> dict[str, Any]:
     pid = str(pod.get("id") or "")
     name = str(pod.get("name") or "")
@@ -397,8 +457,8 @@ def _replica_view(
                 "(replica log fetch disabled in spec — set resources.replica_log_http: true)\n"
             ),
         }
-    use_https = spec.resources.worker_https
-    tls_insecure = not spec.resources.worker_tls_verify
+    use_https = spec.resources.secure_mode
+    tls_insecure = False
     preview = fetch_replica_http_log(
         pod,
         http_port,
@@ -406,8 +466,7 @@ def _replica_view(
         tls_insecure=tls_insecure,
         spec=spec,
     )
-    if len(preview) > log_max:
-        preview = preview[:log_max] + "\n…(truncated)…\n"
+    preview = _tail_for_preview(preview, log_max)
     return {
         "id": pid,
         "name": name,

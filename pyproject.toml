@@ -5,6 +5,7 @@ description = "Minimal GPU cluster reconciler (RunPod today; more vendors planne
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "python-dotenv>=1.0.0",
   "runpod>=1.6.0",
   "PyYAML>=6.0",
   "pydantic>=2.0",

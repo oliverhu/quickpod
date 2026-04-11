@@ -42,6 +42,21 @@ def _compact(s: str) -> str:
     return re.sub(r"\s+", "", s.lower())
 
 
+def resources_gpu_yaml_hint(display_name: str | None) -> str:
+    """Short suggested string for YAML ``resources.gpu`` (substring-matched; see ``resolve_gpu_type_id``)."""
+    if not display_name or not str(display_name).strip():
+        return ""
+    parts = str(display_name).split()
+    if not parts:
+        return ""
+    last = parts[-1]
+    if any(ch.isdigit() for ch in last) and len(parts) >= 2:
+        return "".join(parts[-2:])
+    if any(ch.isdigit() for ch in last):
+        return last
+    return "".join(parts)
+
+
 def resolve_gpu_type_id(gpu_substring: str, api_key: str | None = None) -> str:
     """Return gpuTypes[].id where displayName or id matches substring (case/spacing insensitive)."""
     data = runpod.get_gpus(api_key=api_key)
@@ -103,26 +118,46 @@ def pod_name_prefix(cluster_name: str) -> str:
     return f"{cluster_name}-"
 
 
+# quickpod creates pods as ``{cluster_name}-{uuid4().hex[:8]}`` (8 hex chars, no extra hyphens).
+# A naive ``startswith(cluster_name + '-')`` would wrongly include e.g. ``nova-smoke-proxy-mtls-…``
+# when listing cluster ``nova-smoke-proxy``.
+_POD_NAME_SUFFIX_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
+
+
+def pod_name_matches_cluster(pod_name: str, cluster_name: str) -> bool:
+    """True if ``pod_name`` is exactly ``{cluster_name}-`` plus 8 hex chars (same as ``launch_one_node``)."""
+    if not pod_name or not cluster_name:
+        return False
+    prefix = pod_name_prefix(cluster_name)
+    if not pod_name.startswith(prefix):
+        return False
+    rest = pod_name[len(prefix) :]
+    return len(rest) == 8 and bool(_POD_NAME_SUFFIX_RE.match(rest))
+
+
 def list_managed_pods(
     cluster_name: str,
     api_key: str | None = None,
     *,
     empty_retries: int = 2,
 ) -> list[dict[str, Any]]:
-    """Pods whose name starts with ``{cluster_name}-``.
+    """Pods whose name is exactly ``{cluster_name}-<8 hex>`` (matches ``launch_one_node``).
 
     When the filtered list is empty, **re-fetches** from RunPod up to ``empty_retries`` times
     with short backoff. The API occasionally returns an empty pod list transiently; retries avoid
     false negatives in dashboards and smoke tests. Set ``empty_retries=0`` to disable.
     """
-    prefix = pod_name_prefix(cluster_name)
     delay = 0.22
     last: list[dict[str, Any]] = []
     for attempt in range(max(0, empty_retries) + 1):
         pods = runpod.get_pods(api_key=api_key)
         if not isinstance(pods, list):
             pods = []
-        last = [p for p in pods if (p.get("name") or "").startswith(prefix)]
+        last = [
+            p
+            for p in pods
+            if pod_name_matches_cluster((p.get("name") or ""), cluster_name)
+        ]
         if last:
             return last
         if attempt < empty_retries:
@@ -207,13 +242,9 @@ def fetch_replica_http_log(
         )
     url = f"{'https' if use_https else 'http'}://{host}:{port}{path}"
     headers: dict[str, str] = {}
-    if (
-        spec is not None
-        and use_https
-        and spec.resources.managed_worker_tls
-    ):
+    if spec is not None and use_https and spec.resources.secure_mode:
         headers["Host"] = f"localhost:{port}"
-    if spec is not None and spec.resources.mtls.enabled:
+    if spec is not None and spec.resources.secure_mode:
         tls_kw = httpx_log_fetch_kwargs(spec)
     else:
         verify = True
@@ -241,7 +272,7 @@ def fetch_replica_http_log(
 
 
 def terminate_managed_pods(cluster_name: str, api_key: str | None = None) -> list[str]:
-    """Terminate all pods whose name matches this cluster prefix. Returns terminated ids."""
+    """Terminate pods for this cluster (same name rules as ``list_managed_pods``). Returns terminated ids."""
     import runpod
 
     terminated: list[str] = []

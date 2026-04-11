@@ -13,8 +13,8 @@ import urllib.request
 
 import runpod
 
-from quickpod import secrets
 from quickpod.reconciler import reconcile_once
+from quickpod.runtime_env import require_runpod_api_key
 from quickpod.runpod_client import (
     configure_api,
     count_alive_nodes,
@@ -24,14 +24,6 @@ from quickpod.runpod_client import (
     resolve_gpu_type_id_for_spec,
 )
 from quickpod.spec import load_spec, replica_log_http_port
-
-
-def _api_key() -> str:
-    k = os.environ.get("RUNPOD_API_KEY") or secrets.RUNPOD_API_KEY
-    if not k or "REPLACE" in k:
-        print("Set RUNPOD_API_KEY or secrets.RUNPOD_API_KEY", file=sys.stderr)
-        sys.exit(2)
-    return k
 
 
 def tcp_check(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -102,7 +94,7 @@ def main() -> None:
         print(f"usage: {sys.argv[0]} /path/to/cluster.yaml", file=sys.stderr)
         sys.exit(2)
     spec_path = os.path.abspath(sys.argv[1])
-    key = _api_key()
+    key = require_runpod_api_key()
     configure_api(key)
     spec = load_spec(spec_path)
     cluster = spec.name
@@ -187,7 +179,7 @@ def main() -> None:
         f"ids={[p.get('id') for p in pods_final]}",
         flush=True,
     )
-    print("    (pods left running — no terminate-cluster)", flush=True)
+    print("    (pods left running — no quickpod clusters remove)", flush=True)
 
 
 if __name__ == "__main__":

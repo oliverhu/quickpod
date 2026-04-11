@@ -5,17 +5,17 @@ By default terminates the cluster at the end (RunPod + local store).
 
 With --keep-pods: calls `quickpod.serve_runner.run_serve(..., reconcile=True)` while you use the UI;
 when you stop the server (Ctrl+C or any exit from uvicorn), the script terminates RunPod pods and
-removes the cluster from the local store (same as `terminate-cluster`).
+removes the cluster from the local store (same as `quickpod clusters remove <name> --yes`).
 
   uv run python scripts/smoke_e2e_proxy.py
   uv run python scripts/smoke_e2e_proxy.py --nodes 2   # round-robin check (2× instance cost)
   uv run python scripts/smoke_e2e_proxy.py --keep-pods
   uv run python scripts/smoke_e2e_proxy.py --keep-pods --serve-host 127.0.0.1 --serve-port 8765
 
-HTTPS to workers (Caddy tls internal), same as examples/cluster.yaml — use:
-  uv run python scripts/smoke_e2e_proxy.py --spec examples/cluster_smoke_e2e_https.yaml
+HTTPS + mTLS to workers — use:
+  uv run python scripts/smoke_e2e_proxy.py --spec examples/cluster_smoke_e2e_mtls.yaml
 
-Requires RUNPOD_API_KEY or quickpod.secrets.RUNPOD_API_KEY.
+Requires RUNPOD_API_KEY (environment or `.env`; see README).
 
 Worker readiness wait is fixed at 60 seconds.
 """
@@ -35,8 +35,8 @@ import httpx
 import yaml
 from starlette.testclient import TestClient
 
-from quickpod import secrets
 from quickpod.cluster_store import delete_cluster_record, resolve_database_url
+from quickpod.runtime_env import require_runpod_api_key
 from quickpod.reconciler import reconcile_once
 from quickpod.serve_runner import run_serve
 from quickpod.runpod_client import (
@@ -54,14 +54,6 @@ from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extens
 SMOKE_WORKER_MAX_WAIT_SEC = 60
 
 
-def _api_key() -> str:
-    k = os.environ.get("RUNPOD_API_KEY") or secrets.RUNPOD_API_KEY
-    if not k or "REPLACE" in k:
-        print("Set RUNPOD_API_KEY or secrets.RUNPOD_API_KEY", file=sys.stderr)
-        sys.exit(2)
-    return k
-
-
 def tcp_check(host: str, port: int, timeout: float = 5.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -75,32 +67,24 @@ def _worker_get(
     port: int,
     path: str,
     *,
-    worker_https: bool,
-    tls_insecure: bool,
+    use_https: bool,
     spec: ClusterSpec | None = None,
     timeout: float = 25.0,
 ) -> tuple[int, bytes] | None:
     """GET path from worker (httpx for Py3.11+ compat).
 
-    Managed TLS workers use ``CN=localhost`` while RunPod maps a **public IP** — pass
+    Secure workers use ``CN=localhost`` while RunPod maps a **public IP** — pass
     ``extensions={"sni_hostname": "localhost"}`` so httpcore sets TLS SNI (avoids Caddy **421**).
     """
-    scheme = "https" if worker_https else "http"
+    scheme = "https" if use_https else "http"
     url = f"{scheme}://{host}:{port}{path}"
     extra_headers: dict[str, str] | None = None
-    if (
-        worker_https
-        and spec is not None
-        and spec.resources.managed_worker_tls
-    ):
+    if use_https and spec is not None and spec.resources.secure_mode:
         extra_headers = {"Host": f"localhost:{port}"}
-    if spec is not None and spec.resources.mtls.enabled:
+    if spec is not None and spec.resources.secure_mode:
         tls_kw = httpx_log_fetch_kwargs(spec)
     else:
-        verify = True
-        if worker_https and tls_insecure:
-            verify = False
-        tls_kw = {"verify": verify, "cert": None}
+        tls_kw = {"verify": True, "cert": None}
     try:
         with httpx.Client(
             timeout=timeout,
@@ -125,8 +109,7 @@ def http_json_ok(
     port: int,
     path: str,
     *,
-    worker_https: bool,
-    tls_insecure: bool,
+    use_https: bool,
     spec: ClusterSpec | None = None,
     timeout: float = 25.0,
 ) -> dict | None:
@@ -134,8 +117,7 @@ def http_json_ok(
         host,
         port,
         path,
-        worker_https=worker_https,
-        tls_insecure=tls_insecure,
+        use_https=use_https,
         spec=spec,
         timeout=timeout,
     )
@@ -154,16 +136,14 @@ def worker_log_ok(
     host: str,
     port: int,
     *,
-    worker_https: bool,
-    tls_insecure: bool,
+    use_https: bool,
     spec: ClusterSpec | None = None,
 ) -> bool:
     got = _worker_get(
         host,
         port,
         "/quickpod-log",
-        worker_https=worker_https,
-        tls_insecure=tls_insecure,
+        use_https=use_https,
         spec=spec,
         timeout=25.0,
     )
@@ -199,13 +179,12 @@ def wait_workers_ready(
     log_port: int,
     api_port: int,
     *,
-    worker_https: bool,
-    tls_insecure: bool,
+    use_https: bool,
     spec: ClusterSpec,
     max_wait_sec: int,
     poll_sec: int = 12,
 ) -> list[dict]:
-    scheme = "https" if worker_https else "http"
+    scheme = "https" if use_https else "http"
     deadline = time.monotonic() + max_wait_sec
     while time.monotonic() < deadline:
         pods = list_managed_pods(cluster, api_key=api_key)
@@ -228,8 +207,7 @@ def wait_workers_ready(
             if not worker_log_ok(
                 log_ep[0],
                 log_ep[1],
-                worker_https=worker_https,
-                tls_insecure=tls_insecure,
+                use_https=use_https,
                 spec=spec,
             ):
                 continue
@@ -237,8 +215,7 @@ def wait_workers_ready(
                 api_ep[0],
                 api_ep[1],
                 "/v1/models",
-                worker_https=worker_https,
-                tls_insecure=tls_insecure,
+                use_https=use_https,
                 spec=spec,
             )
             if not j or j.get("object") != "list":
@@ -333,7 +310,7 @@ def main() -> int:
         print("--nodes must be >= 1", file=sys.stderr)
         return 2
 
-    key = _api_key()
+    key = require_runpod_api_key()
     configure_api(key)
     db_url = resolve_database_url(args.database_url)
 
@@ -351,7 +328,7 @@ def main() -> int:
         if api_port is None:
             print("Spec must set resources.worker_api_port.", file=sys.stderr)
             return 2
-        tls_insecure = not spec.resources.worker_tls_verify
+        use_https = spec.resources.secure_mode
 
         if args.clean_start:
             print("== clean-start: terminate existing pods for cluster", flush=True)
@@ -365,7 +342,7 @@ def main() -> int:
 
         print(
             f"== 2) wait for {args.nodes} RUNNING worker(s) "
-            f"({'HTTPS' if spec.resources.worker_https else 'HTTP'} "
+            f"({'HTTPS+mTLS' if use_https else 'HTTP'} "
             f"log:{log_port} api:{api_port})",
             flush=True,
         )
@@ -376,8 +353,7 @@ def main() -> int:
                 args.nodes,
                 log_port,
                 api_port,
-                worker_https=spec.resources.worker_https,
-                tls_insecure=tls_insecure,
+                use_https=use_https,
                 spec=spec,
                 max_wait_sec=SMOKE_WORKER_MAX_WAIT_SEC,
             )
@@ -485,7 +461,7 @@ def main() -> int:
                     flush=True,
                 )
             print(
-                "    Ctrl+C (or stopping uvicorn) will run terminate-cluster for this spec.",
+                "    Ctrl+C (or stopping uvicorn) will tear down like quickpod clusters remove <name> --yes.",
                 flush=True,
             )
             try:

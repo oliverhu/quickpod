@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from typing import Any
 
 from quickpod.runpod_client import list_managed_pods, public_http_endpoint
 from quickpod.spec import ClusterSpec
@@ -24,18 +26,16 @@ class WorkerRing:
             return choice
 
 
-def worker_base_urls(
+def _urls_for_pods(
+    pods: list[dict[str, Any]],
     spec: ClusterSpec,
-    api_key: str | None,
     *,
-    require_running: bool = True,
+    require_running: bool,
 ) -> list[str]:
-    """Base URLs for workers (no trailing slash)."""
     api_p = spec.resources.worker_api_port
     if api_p is None:
         return []
-    scheme = "https" if spec.resources.worker_https else "http"
-    pods = list_managed_pods(spec.name, api_key=api_key)
+    scheme = "https" if spec.resources.secure_mode else "http"
     out: list[str] = []
     for p in pods:
         if require_running and (p.get("desiredStatus") or "").upper() != "RUNNING":
@@ -43,4 +43,33 @@ def worker_base_urls(
         ep = public_http_endpoint(p, api_p)
         if ep:
             out.append(f"{scheme}://{ep[0]}:{ep[1]}")
+    return out
+
+
+def worker_base_urls(
+    spec: ClusterSpec,
+    api_key: str | None,
+    *,
+    require_running: bool = True,
+) -> list[str]:
+    """Base URLs for workers (no trailing slash).
+
+    RunPod sometimes lists pods as RUNNING before ``runtime.ports`` is present; refetch once
+    when we see RUNNING pods but no mapped ports yet.
+    """
+    api_p = spec.resources.worker_api_port
+    if api_p is None:
+        return []
+    pods = list_managed_pods(spec.name, api_key=api_key)
+    out = _urls_for_pods(pods, spec, require_running=require_running)
+    if require_running and not out:
+        running = [
+            p
+            for p in pods
+            if (p.get("desiredStatus") or "").upper() == "RUNNING"
+        ]
+        if running:
+            time.sleep(0.85)
+            pods = list_managed_pods(spec.name, api_key=api_key, empty_retries=0)
+            out = _urls_for_pods(pods, spec, require_running=require_running)
     return out

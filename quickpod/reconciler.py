@@ -4,6 +4,8 @@ import logging
 import threading
 import time
 
+from runpod.error import QueryError
+
 from quickpod.cluster_store import record_pod_launch, upsert_cluster_touch
 from quickpod.runpod_client import (
     count_alive_nodes,
@@ -33,7 +35,7 @@ def reconcile_once(
     alive = count_alive_nodes(pods)
     shortage = spec.num_nodes - alive
     logger.info(
-        "Cluster %s: want %s nodes, ~%s alive (prefix-matched), shortage=%s",
+        "Cluster %s: want %s nodes, ~%s alive, shortage=%s",
         spec.name,
         spec.num_nodes,
         alive,
@@ -54,6 +56,13 @@ def reconcile_once(
                 )
             except Exception:
                 logger.exception("Failed to record pod launch in cluster store")
+        except QueryError as e:
+            logger.warning("Failed to launch pod: %s", e)
+            raise RuntimeError(
+                "RunPod could not deploy a pod (no capacity in listed zones, or the "
+                "provider refused the request). Try other `resources.zones`, a different "
+                f"`resources.gpu`, or retry later. API message: {e}"
+            ) from None
         except Exception:
             logger.exception("Failed to launch pod")
             raise

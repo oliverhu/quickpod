@@ -11,9 +11,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class MtlsConfig(BaseModel):
-    """Mutual TLS: workers (Caddy) require a client cert signed by ``ca_pem``; quickpod presents ``client_*``."""
+    """PEM material for ``secure_mode: true`` (mutual TLS). Ignored when ``secure_mode`` is false."""
 
-    enabled: bool = False
     ca_pem: str = ""
     client_cert_pem: str = ""
     client_key_pem: str = ""
@@ -40,21 +39,6 @@ class MtlsConfig(BaseModel):
         h.update(str(self.verify_server_hostname).encode())
         return h.hexdigest()
 
-    @model_validator(mode="after")
-    def mtls_fields(self) -> MtlsConfig:
-        if not self.enabled:
-            return self
-        for name in (
-            "ca_pem",
-            "client_cert_pem",
-            "client_key_pem",
-            "server_cert_pem",
-            "server_key_pem",
-        ):
-            if not getattr(self, name).strip():
-                raise ValueError(f"resources.mtls.enabled requires non-empty {name}")
-        return self
-
 
 class ResourcesSpec(BaseModel):
     """RunPod pod resources (subset of what create_pod supports)."""
@@ -72,13 +56,17 @@ class ResourcesSpec(BaseModel):
     )
     gpu: str = Field(
         default="RTX4090",
-        description="Substring matched against RunPod gpu displayName (e.g. RTX4090, 4090) when compute_type is GPU",
+        description=(
+            "Substring matched against RunPod gpuTypes displayName or id (case/spacing insensitive). "
+            "See `quickpod list-gpus` field `resourcesGpu` for a suggested value."
+        ),
     )
     bootstrap_gpu: str = Field(
         default="RTX4090",
         description=(
             "When compute_type is CPU: substring to resolve gpuTypes[].id for the required "
-            "gpuTypeId field (actual GPU count is 0; this only satisfies the API)."
+            "gpuTypeId field (actual GPU count is 0; this only satisfies the API). "
+            "Suggested values: `quickpod list-gpus` → `resourcesGpu`."
         ),
     )
     gpu_count: int = Field(
@@ -115,38 +103,27 @@ class ResourcesSpec(BaseModel):
         default=8000,
         description=(
             "Container port quickpod serve proxies to for OpenAI/vLLM API (/v1/...). "
-            "Must be listed in resources.ports (e.g. Caddy HTTPS on 8000)."
+            "Must be listed in resources.ports (Caddy HTTPS on this port when secure_mode is true)."
         ),
     )
-    worker_https: bool = Field(
-        default=True,
-        description="Use https:// when quickpod talks to workers (e.g. Caddy tls internal).",
-    )
-    worker_tls_verify: bool = Field(
-        default=False,
-        description="If False, skip TLS verification to workers (typical for Caddy internal CA).",
-    )
-    managed_worker_tls: bool = Field(
+    secure_mode: bool = Field(
         default=False,
         description=(
-            "If True, quickpod injects Caddy (tls internal) on worker_api_port and log_server_port, "
-            "plus a loopback /quickpod-log server. Your run: script must start the API on "
-            "127.0.0.1:18000 only; do not install Caddy or write a Caddyfile yourself."
+            "If true: quickpod injects Caddy + mTLS on workers; use https:// with client certs. "
+            "Requires resources.mtls PEM fields (or *_file paths ingested at load_spec). "
+            "If false: plain HTTP to workers; you own the full container script (no injection)."
         ),
     )
     managed_log_file: str | None = Field(
         default=None,
         description=(
             "Container path quickpod tees stdout/stderr to and the log sidecar serves via "
-            "/quickpod-log (default /workspace/replica.log when managed_worker_tls is True)."
+            "/quickpod-log (default /workspace/replica.log when secure_mode is true)."
         ),
     )
     mtls: MtlsConfig = Field(
         default_factory=MtlsConfig,
-        description=(
-            "Mutual TLS between quickpod serve and workers: Caddy requires a client cert; "
-            "set enabled and PEM file paths in YAML (see load_spec). Requires managed_worker_tls."
-        ),
+        description="mTLS PEM material; required when secure_mode is true (see load_spec).",
     )
     cloud_type: str = Field(default="SECURE")  # ALL | COMMUNITY | SECURE
     zones: list[str] = Field(
@@ -156,6 +133,25 @@ class ResourcesSpec(BaseModel):
     container_disk_in_gb: int = Field(default=50, ge=10)
     support_public_ip: bool = True
     start_ssh: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_tls_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        legacy = ("worker_https", "worker_tls_verify", "managed_worker_tls")
+        bad = [k for k in legacy if k in data]
+        if bad:
+            raise ValueError(
+                f"Removed fields {bad!r}: use resources.secure_mode "
+                "(true = mTLS + injected Caddy, false = plain HTTP)."
+            )
+        mt = data.get("mtls")
+        if isinstance(mt, dict) and "enabled" in mt:
+            raise ValueError(
+                "Removed resources.mtls.enabled: use resources.secure_mode: true with mtls PEM fields."
+            )
+        return data
 
     @model_validator(mode="after")
     def ports_consistency(self) -> ResourcesSpec:
@@ -185,14 +181,9 @@ class ResourcesSpec(BaseModel):
             raise ValueError(
                 f"worker_api_port {s.worker_api_port} must be in resources.ports"
             )
-        if s.managed_worker_tls:
-            if not s.worker_https:
-                raise ValueError(
-                    "managed_worker_tls requires worker_https: true "
-                    "(Caddy terminates TLS on the mapped ports)"
-                )
+        if s.secure_mode:
             if s.worker_api_port is None:
-                raise ValueError("managed_worker_tls requires worker_api_port")
+                raise ValueError("secure_mode: true requires worker_api_port")
             if s.replica_log_http:
                 lp = (
                     s.log_server_port
@@ -201,18 +192,34 @@ class ResourcesSpec(BaseModel):
                 )
                 if lp is not None and lp == s.worker_api_port:
                     raise ValueError(
-                        "managed_worker_tls with replica_log_http requires distinct "
+                        "secure_mode with replica_log_http requires distinct "
                         "log_server_port and worker_api_port"
                     )
-        if s.mtls.enabled:
-            if not s.managed_worker_tls:
-                raise ValueError("resources.mtls.enabled requires managed_worker_tls: true")
-            if not s.worker_https:
-                raise ValueError("resources.mtls.enabled requires worker_https: true")
-            if not s.worker_tls_verify:
+            for name in (
+                "ca_pem",
+                "client_cert_pem",
+                "client_key_pem",
+                "server_cert_pem",
+                "server_key_pem",
+            ):
+                if not getattr(s.mtls, name).strip():
+                    raise ValueError(
+                        f"secure_mode: true requires non-empty resources.mtls.{name} "
+                        "(set inline *_pem or *_file paths before load_spec)"
+                    )
+        else:
+            if any(
+                getattr(s.mtls, k).strip()
+                for k in (
+                    "ca_pem",
+                    "client_cert_pem",
+                    "client_key_pem",
+                    "server_cert_pem",
+                    "server_key_pem",
+                )
+            ):
                 raise ValueError(
-                    "resources.mtls.enabled requires worker_tls_verify: true "
-                    "(verify server with the same CA as mTLS)"
+                    "resources.mtls is only used when secure_mode: true (or remove mtls fields)"
                 )
         return s
 
@@ -227,7 +234,7 @@ def replica_log_http_port(resources: ResourcesSpec) -> int | None:
 
 
 class ClusterSpec(BaseModel):
-    """Desired state for a logical cluster (name prefix for RunPod pod names)."""
+    """Desired state for a logical cluster (RunPod pods are named ``{name}-{8 hex}``)."""
 
     name: str = Field(min_length=1, pattern=r"^[a-z0-9][a-z0-9-]*$")
     num_nodes: int = Field(ge=1)
@@ -260,10 +267,10 @@ class ClusterSpec(BaseModel):
 
 def _ingest_mtls_pem_files(raw: dict, spec_path: Path) -> None:
     res = raw.get("resources")
-    if not isinstance(res, dict):
+    if not isinstance(res, dict) or not res.get("secure_mode"):
         return
     mt = res.get("mtls")
-    if not isinstance(mt, dict) or not mt.get("enabled"):
+    if not isinstance(mt, dict):
         return
     pem_keys = (
         "ca_pem",
@@ -283,7 +290,7 @@ def _ingest_mtls_pem_files(raw: dict, spec_path: Path) -> None:
     )
     if not any(mt.get(fk) for fk in file_keys):
         raise ValueError(
-            "resources.mtls.enabled requires either inline *_pem fields or *_file paths"
+            "secure_mode: true requires either inline resources.mtls.*_pem fields or *_file paths"
         )
     spec_dir = spec_path.resolve().parent
     mapping = (
@@ -297,12 +304,11 @@ def _ingest_mtls_pem_files(raw: dict, spec_path: Path) -> None:
     for pem_key, file_key in mapping:
         path_str = out.pop(file_key, None)
         if not path_str:
-            raise ValueError(f"resources.mtls.enabled requires resources.mtls.{file_key}")
+            raise ValueError(f"secure_mode: true requires resources.mtls.{file_key}")
         p = (spec_dir / str(path_str)).resolve()
         if not p.is_file():
             raise ValueError(f"mTLS file not found: {p}")
         out[pem_key] = p.read_text()
-    out["enabled"] = True
     res["mtls"] = out
 
 

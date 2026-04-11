@@ -12,8 +12,6 @@ resources:
   ports:
     - 8888
   worker_api_port: 8888
-  worker_https: false
-  worker_tls_verify: false
   cloud_type: ALL
   zones:
     - US-IL-1

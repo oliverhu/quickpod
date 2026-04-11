@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 from quickpod.runpod_client import (
@@ -54,6 +54,39 @@ class PodLaunchRecord(Base):
     )
 
     cluster: Mapped["ClusterRecord"] = relationship(back_populates="launches")
+
+
+class ServeDaemonRecord(Base):
+    """Background `quickpod serve` worker (OpenAI proxy + per-cluster UI) per cluster."""
+
+    __tablename__ = "serve_daemons"
+
+    cluster_name: Mapped[str] = mapped_column(
+        String(256), ForeignKey("clusters.name", ondelete="CASCADE"), primary_key=True
+    )
+    pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    host: Mapped[str] = mapped_column(String(256), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    spec_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ServeLaunchPrefs(Base):
+    """Last `quickpod serve` options per cluster (survives `clusters stop` for `quickpod refresh`)."""
+
+    __tablename__ = "serve_launch_prefs"
+
+    cluster_name: Mapped[str] = mapped_column(
+        String(256), ForeignKey("clusters.name", ondelete="CASCADE"), primary_key=True
+    )
+    spec_path: Mapped[str] = mapped_column(Text, nullable=False)
+    host: Mapped[str] = mapped_column(String(256), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    reconcile: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    ssl_certfile: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ssl_keyfile: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 _engines: dict[str, Any] = {}
@@ -154,6 +187,24 @@ def record_pod_launch(
         session.commit()
 
 
+def get_cluster_record(
+    cluster_name: str, *, database_url: str | None = None
+) -> dict[str, Any] | None:
+    url = init_db(database_url)
+    eng = _make_engine(url)
+    with Session(eng) as session:
+        row = session.get(ClusterRecord, cluster_name)
+        if row is None:
+            return None
+        return {
+            "name": row.name,
+            "num_nodes": row.num_nodes,
+            "spec_path": row.spec_path,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
+
 def delete_cluster_record(cluster_name: str, *, database_url: str | None = None) -> None:
     url = resolve_database_url(database_url)
     if url not in _engines:
@@ -164,6 +215,151 @@ def delete_cluster_record(cluster_name: str, *, database_url: str | None = None)
         if row is not None:
             session.delete(row)
             session.commit()
+
+
+def register_serve_daemon(
+    cluster_name: str,
+    pid: int,
+    host: str,
+    port: int,
+    *,
+    spec_path: str | None,
+    database_url: str | None = None,
+) -> None:
+    url = init_db(database_url)
+    now = datetime.now(timezone.utc)
+    eng = _make_engine(url)
+    with Session(eng) as session:
+        row = session.get(ServeDaemonRecord, cluster_name)
+        if row is None:
+            session.add(
+                ServeDaemonRecord(
+                    cluster_name=cluster_name,
+                    pid=pid,
+                    host=host,
+                    port=port,
+                    spec_path=spec_path,
+                    started_at=now,
+                )
+            )
+        else:
+            row.pid = pid
+            row.host = host
+            row.port = port
+            if spec_path is not None:
+                row.spec_path = spec_path
+            row.started_at = now
+        session.commit()
+
+
+def delete_serve_daemon(cluster_name: str, *, database_url: str | None = None) -> None:
+    url = resolve_database_url(database_url)
+    if url not in _engines:
+        init_db(database_url)
+    eng = _make_engine(url)
+    with Session(eng) as session:
+        row = session.get(ServeDaemonRecord, cluster_name)
+        if row is not None:
+            session.delete(row)
+            session.commit()
+
+
+def get_serve_daemon(
+    cluster_name: str, *, database_url: str | None = None
+) -> dict[str, Any] | None:
+    url = init_db(database_url)
+    eng = _make_engine(url)
+    with Session(eng) as session:
+        row = session.get(ServeDaemonRecord, cluster_name)
+        if row is None:
+            return None
+        return {
+            "cluster_name": row.cluster_name,
+            "pid": row.pid,
+            "host": row.host,
+            "port": row.port,
+            "spec_path": row.spec_path,
+            "started_at": row.started_at,
+        }
+
+
+def upsert_serve_launch_prefs(
+    cluster_name: str,
+    *,
+    spec_path: str,
+    host: str,
+    port: int,
+    reconcile: bool = False,
+    ssl_certfile: str | None = None,
+    ssl_keyfile: str | None = None,
+    database_url: str | None = None,
+) -> None:
+    url = init_db(database_url)
+    eng = _make_engine(url)
+    with Session(eng) as session:
+        row = session.get(ServeLaunchPrefs, cluster_name)
+        if row is None:
+            session.add(
+                ServeLaunchPrefs(
+                    cluster_name=cluster_name,
+                    spec_path=spec_path,
+                    host=host,
+                    port=port,
+                    reconcile=reconcile,
+                    ssl_certfile=ssl_certfile,
+                    ssl_keyfile=ssl_keyfile,
+                )
+            )
+        else:
+            row.spec_path = spec_path
+            row.host = host
+            row.port = port
+            row.reconcile = reconcile
+            row.ssl_certfile = ssl_certfile
+            row.ssl_keyfile = ssl_keyfile
+        session.commit()
+
+
+def get_serve_launch_prefs(
+    cluster_name: str, *, database_url: str | None = None
+) -> dict[str, Any] | None:
+    url = init_db(database_url)
+    eng = _make_engine(url)
+    with Session(eng) as session:
+        row = session.get(ServeLaunchPrefs, cluster_name)
+        if row is None:
+            return None
+        return {
+            "cluster_name": row.cluster_name,
+            "spec_path": row.spec_path,
+            "host": row.host,
+            "port": row.port,
+            "reconcile": bool(row.reconcile),
+            "ssl_certfile": row.ssl_certfile,
+            "ssl_keyfile": row.ssl_keyfile,
+        }
+
+
+def list_serve_daemons(*, database_url: str | None = None) -> list[dict[str, Any]]:
+    url = init_db(database_url)
+    eng = _make_engine(url)
+    with Session(eng) as session:
+        rows = session.scalars(
+            select(ServeDaemonRecord).order_by(ServeDaemonRecord.cluster_name)
+        ).all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "cluster_name": row.cluster_name,
+                    "pid": row.pid,
+                    "host": row.host,
+                    "port": row.port,
+                    "spec_path": row.spec_path,
+                    "started_at": row.started_at,
+                }
+            )
+        return out
 
 
 def iter_cluster_names(*, database_url: str | None = None) -> list[str]:
