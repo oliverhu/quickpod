@@ -2,7 +2,7 @@
 
 - **``secure_mode: true`` (mTLS):** user ``run`` binds the workload on **127.0.0.1:18000**; quickpod
   adds Caddy on ``worker_api_port`` / ``log_server_port`` and a monitor on loopback **18888**
-  (``GET /quickpod/logs``, ``GET /quickpod/system``), using ``resources.mtls`` PEMs.
+  (``GET /quickpod/logs``, ``GET /quickpod/system``, ``GET /quickpod/status``), using ``resources.mtls`` PEMs.
 - **``secure_mode: false``:** quickpod writes and starts the same monitor on **0.0.0.0:log_port**;
   your ``run`` must bind **only** ``worker_api_port`` (distinct from the log port).
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from quickpod.spec import ClusterSpec, ResourcesSpec, replica_log_http_port
+from quickpod.spec import ClusterSpec, HealthCheckSpec, ResourcesSpec, replica_log_http_port
 
 _LOOPBACK_API_PORT = 18000
 _LOOPBACK_LOG_HTTP_PORT = 18888
@@ -117,9 +117,97 @@ import socket
 import socketserver
 import subprocess
 import http.server
+import threading
 import time
 
 LOG = pathlib.Path(__LOG_FILE__)
+LIFECYCLE_PATH = pathlib.Path("/workspace/quickpod-lifecycle.json")
+
+HEALTH_ENABLED = __HEALTH_ENABLED__
+HEALTH_TIMEOUT = __HEALTH_TIMEOUT__
+HEALTH_INTERVAL = __HEALTH_INTERVAL__
+if HEALTH_ENABLED:
+    import base64
+    _hb64 = __HEALTH_B64_REPR__
+    HEALTH_CMD = base64.b64decode(_hb64.encode("ascii")).decode("utf-8")
+else:
+    HEALTH_CMD = ""
+
+_health_lock = threading.Lock()
+_health_state = {"last_exit": None, "last_error": None, "last_ts": None}
+
+
+def _read_lifecycle_phase():
+    try:
+        if not LIFECYCLE_PATH.exists():
+            return "unknown"
+        d = json.loads(LIFECYCLE_PATH.read_text(encoding="utf-8"))
+        p = str(d.get("phase") or "").strip().lower()
+        return p if p in ("setup", "running") else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _health_loop():
+    if not HEALTH_ENABLED:
+        return
+    while True:
+        try:
+            r = subprocess.run(
+                HEALTH_CMD,
+                shell=True,
+                executable="/bin/bash",
+                timeout=HEALTH_TIMEOUT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with _health_lock:
+                _health_state["last_exit"] = r.returncode
+                _health_state["last_error"] = None
+                _health_state["last_ts"] = time.time()
+        except subprocess.TimeoutExpired:
+            with _health_lock:
+                _health_state["last_exit"] = None
+                _health_state["last_error"] = "timeout"
+                _health_state["last_ts"] = time.time()
+        except Exception as e:
+            with _health_lock:
+                _health_state["last_exit"] = None
+                _health_state["last_error"] = str(e)
+                _health_state["last_ts"] = time.time()
+        time.sleep(HEALTH_INTERVAL)
+
+
+def _aggregate_status():
+    phase = _read_lifecycle_phase()
+    if phase == "setup":
+        return "setting_up"
+    if not HEALTH_ENABLED:
+        if phase == "running":
+            return "running"
+        return "unknown"
+    with _health_lock:
+        ts = _health_state["last_ts"]
+        err = _health_state["last_error"]
+        ex = _health_state["last_exit"]
+    if ts is None:
+        return "running"
+    if err == "timeout" or ex is None or ex != 0:
+        return "unhealthy"
+    return "healthy"
+
+
+def _status_json():
+    phase = _read_lifecycle_phase()
+    st = _aggregate_status()
+    hc = {"enabled": bool(HEALTH_ENABLED)}
+    if HEALTH_ENABLED:
+        with _health_lock:
+            hc["command"] = HEALTH_CMD
+            hc["last_exit_code"] = _health_state["last_exit"]
+            hc["last_error"] = _health_state["last_error"]
+            hc["last_check_ts"] = _health_state["last_ts"]
+    return {"lifecycle": phase, "status": st, "health": hc, "ts": time.time()}
 
 
 def _norm_path(path: str) -> str:
@@ -279,6 +367,13 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b)
             return
+        if p == "/quickpod/status":
+            b = json.dumps(_status_json(), indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b)
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -286,27 +381,49 @@ class H(http.server.BaseHTTPRequestHandler):
 _PORT_BIND = __PORT_NUM__
 _HOST = __HOST_JSON__
 
+if HEALTH_ENABLED:
+    threading.Thread(target=_health_loop, daemon=True).start()
+
 socketserver.TCPServer.allow_reuse_address = True
 with socketserver.ThreadingTCPServer((_HOST, _PORT_BIND), H) as httpd:
     httpd.serve_forever()
 '''
 
 
-def _monitor_http_py_body(log_file: str, bind_port: int, bind_host: str) -> str:
+def _monitor_http_py_body(
+    log_file: str,
+    bind_port: int,
+    bind_host: str,
+    health: HealthCheckSpec | None,
+) -> str:
     """Embedded monitor: ``bind_host`` is ``127.0.0.1`` (behind Caddy) or ``0.0.0.0`` (plain HTTP)."""
+    import base64 as _b64
+
+    hb64 = _b64.b64encode(health.command.encode("utf-8")).decode("ascii") if health else ""
+    hb64_repr = repr(hb64)
     return (
         _MONITOR_HTTP_PY_TEMPLATE.replace("__LOG_FILE__", json.dumps(log_file))
         .replace("__PORT_NUM__", str(bind_port))
         .replace("__HOST_JSON__", json.dumps(bind_host))
+        .replace("__HEALTH_ENABLED__", "True" if health else "False")
+        .replace("__HEALTH_TIMEOUT__", str(health.timeout_sec if health else 5.0))
+        .replace("__HEALTH_INTERVAL__", str(health.interval_sec if health else 30.0))
+        .replace("__HEALTH_B64_REPR__", hb64_repr)
     )
 
 
-def plain_monitor_embed_shell(resources: ResourcesSpec) -> str:
+def _shell_write_lifecycle(phase: str) -> str:
+    payload = json.dumps({"phase": phase})
+    return f"cat > /workspace/quickpod-lifecycle.json <<'QPLIFE'\n{payload}\nQPLIFE"
+
+
+def plain_monitor_embed_shell(spec: ClusterSpec) -> str:
     """Shell fragment: write ``quickpod_monitor_http.py`` and start it (``secure_mode: false``)."""
+    resources = spec.resources
     log_file = (resources.managed_log_file or "/workspace/replica.log").strip()
     lp = replica_log_http_port(resources)
     assert lp is not None
-    py = _monitor_http_py_body(log_file, lp, "0.0.0.0")
+    py = _monitor_http_py_body(log_file, lp, "0.0.0.0", spec.health)
     lines = [
         "mkdir -p /workspace",
         "cat > /workspace/quickpod_monitor_http.py <<'QPLOGEOF'",
@@ -318,7 +435,7 @@ def plain_monitor_embed_shell(resources: ResourcesSpec) -> str:
     return "\n".join(lines)
 
 
-def managed_setup_block(resources: ResourcesSpec) -> str:
+def managed_setup_block(resources: ResourcesSpec, health: HealthCheckSpec | None) -> str:
     """Shell after user ``setup``: Caddy, Caddyfile, optional log HTTP script."""
     lines = [
         'ARCH=$(uname -m)',
@@ -348,7 +465,7 @@ def managed_setup_block(resources: ResourcesSpec) -> str:
 
     if resources.replica_log_http:
         log_file = (resources.managed_log_file or "/workspace/replica.log").strip()
-        py = _monitor_http_py_body(log_file, _LOOPBACK_LOG_HTTP_PORT, "127.0.0.1")
+        py = _monitor_http_py_body(log_file, _LOOPBACK_LOG_HTTP_PORT, "127.0.0.1", health)
         lines.append("cat > /workspace/quickpod_monitor_http.py <<'QPLOGEOF'")
         lines.append(py.rstrip("\n"))
         lines.append("QPLOGEOF")
@@ -380,9 +497,14 @@ def build_container_startup_script(spec: ClusterSpec) -> str:
         if spec.resources.replica_log_http:
             return (
                 header_plain
+                + "mkdir -p /workspace\n"
+                + _shell_write_lifecycle("setup")
+                + "\n"
+                + plain_monitor_embed_shell(spec)
+                + "\n"
                 + spec.setup.strip()
                 + "\n"
-                + plain_monitor_embed_shell(spec.resources)
+                + _shell_write_lifecycle("running")
                 + "\n"
                 + spec.run.strip()
                 + "\n"
@@ -399,9 +521,13 @@ def build_container_startup_script(spec: ClusterSpec) -> str:
     )
     return (
         header
+        + _shell_write_lifecycle("setup")
+        + "\n"
         + spec.setup.strip()
         + "\n"
-        + managed_setup_block(spec.resources)
+        + _shell_write_lifecycle("running")
+        + "\n"
+        + managed_setup_block(spec.resources, spec.health)
         + "\n"
         + managed_run_block(spec.resources, spec.run)
         + "\n"

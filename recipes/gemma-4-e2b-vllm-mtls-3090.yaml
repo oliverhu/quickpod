@@ -1,0 +1,68 @@
+# Recipe: Gemma 4 E2B IT via vLLM OpenAI server, HTTPS + mTLS to workers (RTX 3090).
+#
+# Certs (repo root):  scripts/gen_mtls_certs.sh examples/mtls_smoke_certs
+# Paths below are relative to this file (recipes/).
+#
+# Hugging Face: accept the model license on huggingface.co, then set ``HF_TOKEN`` in ``envs`` below
+# (do not commit real tokens). RunPod env values must not contain double quotes (GraphQL).
+#
+# E2E smoke (long first boot — downloads + vLLM load):
+#   set -a && . ./.env && set +a   # RUNPOD_API_KEY
+#   uv run python scripts/smoke_e2e_proxy.py --spec recipes/gemma-4-e2b-vllm-mtls-3090.yaml --clean-start --worker-wait-sec 7200
+
+name: recipe-gemma-4-e2b-mtls
+num_nodes: 1
+reconcile_interval_seconds: 120
+
+resources:
+  compute_type: GPU
+  image: runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel
+  gpu: RTX3090
+  gpu_count: 1
+  ports:
+    - 8888
+    - 8000
+  log_server_port: 8888
+  worker_api_port: 8000
+  secure_mode: true
+  cloud_type: ALL
+  zones:
+    - US-IL-1
+    - US-TX-1
+    - US-CA-1
+    - US-DE-1
+    - US-WA-1
+  container_disk_in_gb: 80
+  mtls:
+    verify_server_hostname: false
+    ca_file: ../examples/mtls_smoke_certs/ca.pem
+    client_cert_file: ../examples/mtls_smoke_certs/client.crt
+    client_key_file: ../examples/mtls_smoke_certs/client.key
+    server_cert_file: ../examples/mtls_smoke_certs/server.pem
+    server_key_file: ../examples/mtls_smoke_certs/server.key
+
+envs:
+  HF_MODEL_ID: google/gemma-4-E2B-it
+  # Paste token from https://huggingface.co/settings/tokens (do not commit real values).
+  HF_TOKEN: ""
+
+# Optional: vLLM OpenAI server on loopback (see run:); exit 0 => healthy on /quickpod/status.
+health:
+  command: curl -fsS "http://127.0.0.1:18000/v1/models"
+  timeout_sec: 5
+  interval_sec: 30
+
+setup: |
+  set -euo pipefail
+  pip install --upgrade pip
+  pip install "vllm>=0.8.0"
+  pip install --upgrade "transformers>=5.5.0"
+  pip install hf_transfer
+
+run: |
+  export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+  exec python -m vllm.entrypoints.openai.api_server \
+    --model "${HF_MODEL_ID}" \
+    --host 127.0.0.1 \
+    --port 18000 \
+    --dtype auto

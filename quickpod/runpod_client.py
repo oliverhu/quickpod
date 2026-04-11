@@ -16,7 +16,7 @@ from runpod.error import QueryError
 
 from quickpod.graphql_pod import deploy_gpu_pod
 from quickpod.managed_worker import build_container_startup_script
-from quickpod.monitoring_paths import MONITOR_LOGS_PATH, MONITOR_SYSTEM_PATH
+from quickpod.monitoring_paths import MONITOR_LOGS_PATH, MONITOR_STATUS_PATH, MONITOR_SYSTEM_PATH
 from quickpod.spec import ClusterSpec
 from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
 
@@ -323,6 +323,37 @@ def fetch_replica_system_snapshot(
         return {"error": "invalid JSON from replica /quickpod/system", "raw_preview": raw[:400]}
     if not isinstance(out, dict):
         return {"error": "unexpected JSON type from replica /quickpod/system"}
+    return out
+
+
+def fetch_replica_status_snapshot(
+    pod: dict[str, Any],
+    private_port: int,
+    path: str = MONITOR_STATUS_PATH,
+    *,
+    use_https: bool | None = None,
+    tls_insecure: bool | None = None,
+    timeout_sec: float = 8.0,
+    spec: ClusterSpec | None = None,
+) -> dict[str, Any]:
+    """GET JSON lifecycle/health status from the replica monitor (default ``/quickpod/status``)."""
+    raw = _fetch_replica_http_get(
+        pod,
+        private_port,
+        path,
+        use_https=use_https,
+        tls_insecure=tls_insecure,
+        timeout_sec=timeout_sec,
+        spec=spec,
+    )
+    if raw.startswith("("):
+        return {"error": raw.strip(), "lifecycle": "unknown", "status": "unknown"}
+    try:
+        out = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "invalid JSON from replica /quickpod/status", "raw_preview": raw[:400]}
+    if not isinstance(out, dict):
+        return {"error": "unexpected JSON type from replica /quickpod/status"}
     return out
 
 

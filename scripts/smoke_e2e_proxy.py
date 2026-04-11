@@ -17,7 +17,7 @@ HTTPS + mTLS to workers — use:
 
 Requires RUNPOD_API_KEY (environment or `.env`; see README).
 
-Worker readiness wait is fixed at 60 seconds.
+Worker readiness wait defaults to 60 seconds; use ``--worker-wait-sec`` for slow starts (e.g. vLLM + large models).
 """
 
 from __future__ import annotations
@@ -47,11 +47,12 @@ from quickpod.runpod_client import (
     resolve_gpu_type_id_for_spec,
     terminate_managed_pods,
 )
+from quickpod.monitoring_paths import MONITOR_STATUS_PATH
 from quickpod.spec import ClusterSpec, load_spec, replica_log_http_port
 from quickpod.web_app import build_app
 from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
 
-SMOKE_WORKER_MAX_WAIT_SEC = 60
+DEFAULT_WORKER_WAIT_SEC = 60
 
 
 def tcp_check(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -231,6 +232,20 @@ def wait_workers_ready(
             data = j.get("data")
             if not isinstance(data, list) or not data:
                 continue
+            if spec.health is not None:
+                qst = http_json_ok(
+                    log_ep[0],
+                    log_ep[1],
+                    MONITOR_STATUS_PATH,
+                    use_https=use_https,
+                    spec=spec,
+                    timeout=25.0,
+                )
+                if not qst or not isinstance(qst.get("status"), str):
+                    continue
+                # Same probe as spec.health.command (e.g. curl vLLM); allow running until poll marks healthy.
+                if qst["status"] not in ("healthy", "running"):
+                    continue
             ok.append(p)
         if len(ok) >= desired:
             return ok[:desired]
@@ -240,8 +255,12 @@ def wait_workers_ready(
             flush=True,
         )
         time.sleep(poll_sec)
+    extra = ""
+    if spec.health is not None:
+        extra = f" + {MONITOR_STATUS_PATH} (health probe)"
     raise TimeoutError(
-        f"workers not ready in {max_wait_sec}s (want {desired} with /quickpod/logs + /quickpod/system + /v1/models via {scheme})"
+        f"workers not ready in {max_wait_sec}s (want {desired} with /quickpod/logs + "
+        f"/quickpod/system + /v1/models{extra} via {scheme})"
     )
 
 
@@ -313,6 +332,16 @@ def main() -> int:
         default=None,
         help="Same as quickpod --database-url (default ~/.quickpod/state.db)",
     )
+    ap.add_argument(
+        "--worker-wait-sec",
+        type=int,
+        default=DEFAULT_WORKER_WAIT_SEC,
+        metavar="SEC",
+        help=(
+            "Max seconds to wait for each worker to pass /quickpod/logs, /quickpod/system, and "
+            "/v1/models (default 60; use 1800–7200 for vLLM first boot + HF download)"
+        ),
+    )
     args = ap.parse_args()
     if args.nodes < 1:
         print("--nodes must be >= 1", file=sys.stderr)
@@ -363,7 +392,7 @@ def main() -> int:
                 api_port,
                 use_https=use_https,
                 spec=spec,
-                max_wait_sec=SMOKE_WORKER_MAX_WAIT_SEC,
+                max_wait_sec=args.worker_wait_sec,
             )
         except TimeoutError as e:
             print(f"FAIL: {e}", file=sys.stderr)
@@ -417,6 +446,19 @@ def main() -> int:
                 lr = client.get(f"/api/replicas/{pod_ids[0]}/log")
                 if lr.status_code != 200 or len(lr.text) < 5:
                     print(f"WARN replica log short or status {lr.status_code}", flush=True)
+                if spec.health is not None:
+                    sr = client.get(f"/api/replicas/{pod_ids[0]}/status")
+                    if sr.status_code != 200:
+                        print(
+                            f"FAIL /api/replicas/.../status status {sr.status_code}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    sj = sr.json()
+                    if not isinstance(sj.get("status"), str):
+                        print(f"FAIL unexpected status JSON: {sj!r}", file=sys.stderr)
+                        return 1
+                    print(f"    replica /quickpod/status (via API): {sj.get('status')!r}", flush=True)
 
             if args.nodes >= 2:
                 print("== 4) round-robin: collect model ids from /v1/models", flush=True)

@@ -84,8 +84,8 @@ class ResourcesSpec(BaseModel):
         description=(
             "If True, quickpod serve pulls replica monitoring from log_server_port and quickpod "
             "injects the monitor in the container startup script (secure_mode or not): "
-            "GET /quickpod/logs (plain text) and GET /quickpod/system (JSON). Set False to skip "
-            "injection and dashboard fetches."
+            "GET /quickpod/logs (plain text), GET /quickpod/system (JSON), GET /quickpod/status "
+            "(lifecycle + optional health). Set False to skip injection and dashboard fetches."
         ),
     )
     ports: list[int] = Field(
@@ -235,6 +235,28 @@ class ResourcesSpec(BaseModel):
         return s
 
 
+class HealthCheckSpec(BaseModel):
+    """Optional shell probe on the replica: exit code 0 means healthy (monitored on ``interval_sec``)."""
+
+    command: str = Field(
+        min_length=1,
+        description=(
+            'Shell command run inside the container, e.g. '
+            'curl -fsS "http://127.0.0.1:8000/v1/models". Exit 0 → healthy; non-zero or timeout → unhealthy.'
+        ),
+    )
+    timeout_sec: float = Field(default=5.0, ge=0.5, le=300.0)
+    interval_sec: float = Field(default=30.0, ge=1.0, le=3600.0)
+
+    @field_validator("command")
+    @classmethod
+    def strip_command(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("health.command must be non-empty")
+        return s
+
+
 def replica_log_http_port(resources: ResourcesSpec) -> int | None:
     """Private port mapped for GET /quickpod/logs and /quickpod/system on replicas, or None."""
     if not resources.replica_log_http:
@@ -254,6 +276,10 @@ class ClusterSpec(BaseModel):
     envs: dict[str, str] = Field(default_factory=dict)
     setup: str = ""
     run: str = ""
+    health: HealthCheckSpec | None = Field(
+        default=None,
+        description="Optional health probe (see HealthCheckSpec); requires replica_log_http.",
+    )
 
     @field_validator("envs")
     @classmethod
@@ -274,6 +300,14 @@ class ClusterSpec(BaseModel):
         if not s:
             return ""
         return textwrap.dedent(s).strip()
+
+    @model_validator(mode="after")
+    def health_requires_replica_monitor(self) -> ClusterSpec:
+        if self.health is not None and not self.resources.replica_log_http:
+            raise ValueError(
+                "health: requires resources.replica_log_http: true (embedded monitor serves /quickpod/status)"
+            )
+        return self
 
 
 def _ingest_mtls_pem_files(raw: dict, spec_path: Path) -> None:

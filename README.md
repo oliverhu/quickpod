@@ -20,7 +20,7 @@ Basic functionalities:
 - *Simple UI*. A very simple UI to manage the cluster (stop/delete) and see the logs.
 
 
-The `example/cluster_smoke_e2e_mtls.yaml` is a good example to follow for a quick example.
+See **`examples/`** for small smoke specs and **`recipes/`** for fuller workloads (e.g. vLLM + Gemma). `examples/cluster_smoke_e2e_mtls.yaml` is a good minimal mTLS walkthrough below.
 
 ## Install
 
@@ -134,6 +134,27 @@ For a simpler HTTP-only mock on port 8888, see `examples/cluster_smoke_e2e.yaml`
 ```bash
 uv run quickpod serve --spec examples/cluster_smoke_e2e.yaml
 ```
+
+---
+
+## Recipes
+
+Ready-made specs live under [`recipes/`](recipes/). They combine `setup` / `run` for real inference stacks; paths to mTLS PEMs are **relative to the recipe file** (usually `../examples/mtls_smoke_certs/...`).
+
+### Gemma 4 E2B IT + vLLM (mTLS, RTX 3090)
+
+[`recipes/gemma-4-e2b-vllm-mtls-3090.yaml`](recipes/gemma-4-e2b-vllm-mtls-3090.yaml) runs **[`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it)** with **vLLM**’s OpenAI server on **`127.0.0.1:18000`** (Caddy + mTLS on `worker_api_port`), same pattern as `examples/cluster.yaml`. It requests an **RTX 3090**, `secure_mode: true`, and `cloud_type: ALL` with several zones for capacity.
+
+1. **Certificates** (once): `./scripts/gen_mtls_certs.sh examples/mtls_smoke_certs`
+2. **Hugging Face:** accept the model license, then set **`HF_TOKEN`** in the recipe’s **`envs`** (do not commit real tokens). Env values cannot contain `"` (RunPod GraphQL).
+3. **Run**
+   - Local proxy + UI:  
+     `uv run quickpod serve --spec recipes/gemma-4-e2b-vllm-mtls-3090.yaml`
+   - **Optional E2E** (provisions GPU, waits for `/quickpod/logs`, `/quickpod/system`, and `/v1/models` over mTLS; first boot can take a long time):  
+     `uv run python scripts/smoke_e2e_proxy.py --spec recipes/gemma-4-e2b-vllm-mtls-3090.yaml --clean-start --worker-wait-sec 7200`  
+     Use `--worker-wait-sec` because vLLM + model download often exceeds the default 60s readiness window.
+
+Until vLLM is ready, **`/v1/models`** may briefly return **502** from the worker; that clears once the engine is up.
 
 ---
 

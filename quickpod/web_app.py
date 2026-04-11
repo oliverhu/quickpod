@@ -18,6 +18,7 @@ from quickpod.runpod_client import (
     count_alive_nodes,
     count_ready_nodes,
     fetch_replica_http_log,
+    fetch_replica_status_snapshot,
     fetch_replica_system_snapshot,
     list_managed_pods,
 )
@@ -78,6 +79,28 @@ def _format_system_plain(s: Any) -> str:
         v = f"{gm}% VRAM" if gm is not None else "VRAM —"
         parts.append(f"GPU{idx} {u} · {v}")
     return " · ".join(parts) if parts else "—"
+
+
+def _format_quickpod_status_plain(q: Any) -> str:
+    """One-line summary for replica lifecycle/health (matches client ``formatQuickpodStatus``)."""
+    if not isinstance(q, dict):
+        return "—"
+    err = q.get("error")
+    if err:
+        return str(err)[:320]
+    st = q.get("status")
+    labels = {
+        "setting_up": "Setting up",
+        "running": "Running",
+        "healthy": "Healthy",
+        "unhealthy": "Unhealthy",
+        "unknown": "Unknown",
+    }
+    if st in labels:
+        return f"Status: {labels[st]}"
+    if st:
+        return f"Status: {st}"
+    return "—"
 
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -157,6 +180,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       color: #c8d4e0;
     }}
     .meta {{ font-size: 0.75rem; color: var(--muted); padding: 0 0.85rem 0.65rem; }}
+    .status-line {{
+      font-size: 0.78rem;
+      color: #9ecfff;
+      padding: 0 0.85rem 0.35rem;
+      line-height: 1.35;
+    }}
     .sys-line {{
       font-size: 0.78rem;
       color: #a8b8cc;
@@ -235,6 +264,22 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     return out.length ? esc(out.join(' · ')) : esc('—');
   }}
 
+  function formatQuickpodStatus(q) {{
+    if (!q || typeof q !== 'object') return esc('—');
+    if (q.error) return esc(String(q.error));
+    const labels = {{
+      setting_up: 'Setting up',
+      running: 'Running',
+      healthy: 'Healthy',
+      unhealthy: 'Unhealthy',
+      unknown: 'Unknown',
+    }};
+    const st = q.status;
+    if (st && labels[st]) return esc('Status: ' + labels[st]);
+    if (st) return esc('Status: ' + st);
+    return esc('—');
+  }}
+
   function scrollReplicaLogsToBottom() {{
     const grid = document.getElementById('replica-grid');
     if (!grid) return;
@@ -258,11 +303,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       const stCls = (r.status || '').toUpperCase() === 'RUNNING' ? 'st-running' : 'st-warn';
       const ep = r.endpoint ? esc(r.endpoint) : esc(r.endpoint_note || '—');
       const prev = esc(tailPreview(r.log_preview, 4000));
+      const qst = formatQuickpodStatus(r.quickpod_status);
       const sys = formatSystem(r.system);
       return (
         '<article>' +
           '<header><span>' + esc(r.name) + '</span><span class="' + stCls + '">' + esc(r.status) + '</span></header>' +
           '<div class="meta">id <code>' + esc(r.id) + '</code> · ' + ep + '</div>' +
+          '<div class="status-line">' + qst + '</div>' +
           '<div class="sys-line">' + sys + '</div>' +
           '<pre>' + prev + '</pre>' +
         '</article>'
@@ -304,7 +351,8 @@ def build_app(
 ) -> FastAPI:
     http_port = replica_log_http_port(spec.resources)
     log_footer = (
-        f"port {http_port} → <code>/quickpod/logs</code> & <code>/quickpod/system</code> "
+        f"port {http_port} → <code>/quickpod/logs</code>, <code>/quickpod/system</code>, "
+        f"<code>/quickpod/status</code> "
         f"(via quickpod → worker {'HTTPS+mTLS' if spec.resources.secure_mode else 'HTTP'})"
         if http_port is not None
         else "disabled (<code>replica_log_http: false</code>)"
@@ -484,6 +532,25 @@ def build_app(
                 return JSONResponse(data)
         raise HTTPException(status_code=404, detail="pod not found")
 
+    @app.get("/api/replicas/{pod_id}/status")
+    def api_replica_status(pod_id: str) -> JSONResponse:
+        pods = list_managed_pods(spec.name, api_key=api_key)
+        for p in pods:
+            if str(p.get("id")) == pod_id:
+                if http_port is None:
+                    return JSONResponse(
+                        {"error": "replica monitor disabled in spec (resources.replica_log_http: false)"}
+                    )
+                data = fetch_replica_status_snapshot(
+                    p,
+                    http_port,
+                    use_https=spec.resources.secure_mode,
+                    tls_insecure=False,
+                    spec=spec,
+                )
+                return JSONResponse(data)
+        raise HTTPException(status_code=404, detail="pod not found")
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         snap = _snapshot()
@@ -499,11 +566,13 @@ def build_app(
             log_preview = html.escape(
                 _tail_for_preview(r["log_preview"], _LOG_PREVIEW_UI_MAX)
             )
+            status_line = html.escape(_format_quickpod_status_plain(r.get("quickpod_status")))
             sys_line = html.escape(_format_system_plain(r.get("system")))
             cards.append(
                 f"""<article>
   <header><span>{name}</span><span class="{st_cls}">{st}</span></header>
   <div class="meta">id <code>{pid}</code> · {ep_disp}</div>
+  <div class="status-line">{status_line}</div>
   <div class="sys-line">{sys_line}</div>
   <pre>{log_preview}</pre>
 </article>"""
@@ -543,6 +612,7 @@ def _replica_view(
                 "(replica log fetch disabled in spec — set resources.replica_log_http: true)\n"
             ),
             "system": {"error": "replica monitor disabled in spec"},
+            "quickpod_status": {"error": "replica monitor disabled in spec"},
         }
     use_https = spec.resources.secure_mode
     tls_insecure = False
@@ -561,6 +631,13 @@ def _replica_view(
         tls_insecure=tls_insecure,
         spec=spec,
     )
+    quickpod_status = fetch_replica_status_snapshot(
+        pod,
+        http_port,
+        use_https=use_https,
+        tls_insecure=tls_insecure,
+        spec=spec,
+    )
     return {
         "id": pid,
         "name": name,
@@ -569,4 +646,5 @@ def _replica_view(
         "endpoint_note": "API: use this host /v1 only (not worker IPs)",
         "log_preview": preview,
         "system": system,
+        "quickpod_status": quickpod_status,
     }
