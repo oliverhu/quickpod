@@ -1,11 +1,15 @@
-"""Inject Caddy + /quickpod-log sidecar when ``resources.secure_mode`` is true (mTLS).
+"""Inject Caddy + managed monitoring when ``replica_log_http`` is true.
 
-User writes ``setup`` (deps) and ``run`` (workload binding **127.0.0.1:18000**). quickpod adds
-Caddy on ``worker_api_port`` / ``log_server_port`` and the log helper on loopback **18888**,
-using PEMs from ``resources.mtls`` (client auth required).
+- **``secure_mode: true`` (mTLS):** user ``run`` binds the workload on **127.0.0.1:18000**; quickpod
+  adds Caddy on ``worker_api_port`` / ``log_server_port`` and a monitor on loopback **18888**
+  (``GET /quickpod/logs``, ``GET /quickpod/system``), using ``resources.mtls`` PEMs.
+- **``secure_mode: false``:** quickpod writes and starts the same monitor on **0.0.0.0:log_port**;
+  your ``run`` must bind **only** ``worker_api_port`` (distinct from the log port).
 """
 
 from __future__ import annotations
+
+import json
 
 from quickpod.spec import ClusterSpec, ResourcesSpec, replica_log_http_port
 
@@ -104,29 +108,214 @@ def _mtls_embed_lines(resources: ResourcesSpec) -> list[str]:
     return lines
 
 
-def _log_http_py_body(log_file: str) -> str:
-    return f'''import pathlib
+_MONITOR_HTTP_PY_TEMPLATE = r'''import csv
+import io
+import json
+import os
+import pathlib
+import socket
 import socketserver
+import subprocess
 import http.server
-LOG = pathlib.Path({log_file!r})
+import time
+
+LOG = pathlib.Path(__LOG_FILE__)
+
+
+def _norm_path(path: str) -> str:
+    p = path.split("?", 1)[0].rstrip("/")
+    return p if p else "/"
+
+
+def _meminfo():
+    fields = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                key = parts[0].rstrip(":")
+                try:
+                    fields[key] = int(parts[1]) * 1024
+                except ValueError:
+                    pass
+    except OSError:
+        fields = {}
+    total = fields.get("MemTotal", 0)
+    avail = fields.get("MemAvailable")
+    if avail is None:
+        free = fields.get("MemFree", 0)
+        buff = fields.get("Buffers", 0)
+        cached = fields.get("Cached", 0)
+        avail = free + buff + cached
+    used = max(0, total - avail) if total else 0
+    pct = round(100.0 * used / total, 2) if total else None
+    return {
+        "total_bytes": total,
+        "available_bytes": avail,
+        "used_bytes": used,
+        "used_percent": pct,
+    }
+
+
+def _cpu_times():
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            line = f.readline()
+    except OSError:
+        return None
+    parts = line.split()
+    if len(parts) < 5 or not parts[0].startswith("cpu"):
+        return None
+    nums = []
+    for x in parts[1:]:
+        try:
+            nums.append(int(x))
+        except ValueError:
+            break
+    if len(nums) < 4:
+        return None
+    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+    total = sum(nums)
+    return idle, total
+
+
+def _cpu_percent():
+    a = _cpu_times()
+    if not a:
+        return None
+    time.sleep(0.12)
+    b = _cpu_times()
+    if not b:
+        return None
+    di = b[0] - a[0]
+    dt = b[1] - a[1]
+    if dt <= 0:
+        return None
+    busy = 100.0 * (1.0 - (di / dt))
+    return round(max(0.0, min(100.0, busy)), 2)
+
+
+def _loadavg():
+    try:
+        return list(os.getloadavg())
+    except OSError:
+        return None
+
+
+def _gpus():
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=6,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    gpus = []
+    for line in out.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = next(csv.reader(io.StringIO(line)))
+        if len(row) < 4:
+            continue
+        try:
+            idx = int(row[0].strip())
+            u_gpu = float(row[1].strip().replace("%", ""))
+            mu_mib = float(row[2].strip().replace("MiB", "").strip())
+            mt_mib = float(row[3].strip().replace("MiB", "").strip())
+        except ValueError:
+            continue
+        mu = int(mu_mib * 1024 * 1024)
+        mt = int(mt_mib * 1024 * 1024)
+        m_pct = round(100.0 * mu / mt, 2) if mt else None
+        gpus.append(
+            {
+                "index": idx,
+                "name": "GPU %d" % idx,
+                "utilization_percent": round(u_gpu, 2),
+                "memory_used_bytes": mu,
+                "memory_total_bytes": mt,
+                "memory_used_percent": m_pct,
+            }
+        )
+    return gpus
+
+
+def _system_json():
+    return {
+        "hostname": socket.gethostname(),
+        "cpu": {"percent": _cpu_percent(), "loadavg": _loadavg()},
+        "memory": _meminfo(),
+        "gpus": _gpus(),
+        "ts": time.time(),
+    }
+
+
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         return
+
     def do_GET(self):
-        p = self.path.split("?", 1)[0].rstrip("/")
-        if p != "/quickpod-log":
-            self.send_response(404)
+        p = _norm_path(self.path)
+        if p == "/quickpod/logs":
+            body = LOG.read_bytes() if LOG.exists() else b"(no log yet)\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
+            self.wfile.write(body)
             return
-        body = LOG.read_bytes() if LOG.exists() else b"(no log yet)\\n"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        if p == "/quickpod/system":
+            b = json.dumps(_system_json(), indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b)
+            return
+        self.send_response(404)
         self.end_headers()
-        self.wfile.write(body)
+
+
+_PORT_BIND = __PORT_NUM__
+_HOST = __HOST_JSON__
+
 socketserver.TCPServer.allow_reuse_address = True
-with socketserver.ThreadingTCPServer(("127.0.0.1", {_LOOPBACK_LOG_HTTP_PORT}), H) as httpd:
+with socketserver.ThreadingTCPServer((_HOST, _PORT_BIND), H) as httpd:
     httpd.serve_forever()
 '''
+
+
+def _monitor_http_py_body(log_file: str, bind_port: int, bind_host: str) -> str:
+    """Embedded monitor: ``bind_host`` is ``127.0.0.1`` (behind Caddy) or ``0.0.0.0`` (plain HTTP)."""
+    return (
+        _MONITOR_HTTP_PY_TEMPLATE.replace("__LOG_FILE__", json.dumps(log_file))
+        .replace("__PORT_NUM__", str(bind_port))
+        .replace("__HOST_JSON__", json.dumps(bind_host))
+    )
+
+
+def plain_monitor_embed_shell(resources: ResourcesSpec) -> str:
+    """Shell fragment: write ``quickpod_monitor_http.py`` and start it (``secure_mode: false``)."""
+    log_file = (resources.managed_log_file or "/workspace/replica.log").strip()
+    lp = replica_log_http_port(resources)
+    assert lp is not None
+    py = _monitor_http_py_body(log_file, lp, "0.0.0.0")
+    lines = [
+        "mkdir -p /workspace",
+        "cat > /workspace/quickpod_monitor_http.py <<'QPLOGEOF'",
+        py.rstrip("\n"),
+        "QPLOGEOF",
+        f'echo "quickpod: managed /quickpod/logs + /quickpod/system on 0.0.0.0:{lp}"',
+        "python3 -u /workspace/quickpod_monitor_http.py &",
+    ]
+    return "\n".join(lines)
 
 
 def managed_setup_block(resources: ResourcesSpec) -> str:
@@ -159,8 +348,8 @@ def managed_setup_block(resources: ResourcesSpec) -> str:
 
     if resources.replica_log_http:
         log_file = (resources.managed_log_file or "/workspace/replica.log").strip()
-        py = _log_http_py_body(log_file)
-        lines.append("cat > /workspace/quickpod_loghttp.py <<'QPLOGEOF'")
+        py = _monitor_http_py_body(log_file, _LOOPBACK_LOG_HTTP_PORT, "127.0.0.1")
+        lines.append("cat > /workspace/quickpod_monitor_http.py <<'QPLOGEOF'")
         lines.append(py.rstrip("\n"))
         lines.append("QPLOGEOF")
 
@@ -179,7 +368,7 @@ def managed_run_block(resources: ResourcesSpec, user_run: str) -> str:
         'mkdir -p "$XDG_DATA_HOME"',
     ]
     if resources.replica_log_http:
-        lines.append("python3 -u /workspace/quickpod_loghttp.py &")
+        lines.append("python3 -u /workspace/quickpod_monitor_http.py &")
     lines.extend(["(", ur, ") &", "exec caddy run --config /workspace/Caddyfile --adapter caddyfile"])
     return "\n".join(lines)
 
@@ -188,6 +377,16 @@ def build_container_startup_script(spec: ClusterSpec) -> str:
     """Full bash script embedded as ORCH_B64."""
     header_plain = "#!/usr/bin/env bash\nset -euo pipefail\n"
     if not spec.resources.secure_mode:
+        if spec.resources.replica_log_http:
+            return (
+                header_plain
+                + spec.setup.strip()
+                + "\n"
+                + plain_monitor_embed_shell(spec.resources)
+                + "\n"
+                + spec.run.strip()
+                + "\n"
+            )
         return header_plain + spec.setup.strip() + "\n" + spec.run.strip() + "\n"
 
     managed_worker_validate(spec.resources)

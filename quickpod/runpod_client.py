@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -15,6 +16,7 @@ from runpod.error import QueryError
 
 from quickpod.graphql_pod import deploy_gpu_pod
 from quickpod.managed_worker import build_container_startup_script
+from quickpod.monitoring_paths import MONITOR_LOGS_PATH, MONITOR_SYSTEM_PATH
 from quickpod.spec import ClusterSpec
 from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
 
@@ -213,17 +215,17 @@ def public_http_endpoint(
     return None
 
 
-def fetch_replica_http_log(
+def _fetch_replica_http_get(
     pod: dict[str, Any],
     private_port: int,
-    path: str = "/quickpod-log",
+    path: str,
     *,
     use_https: bool | None = None,
     tls_insecure: bool | None = None,
     timeout_sec: float = 8.0,
     spec: ClusterSpec | None = None,
 ) -> str:
-    """GET http(s)://public_ip:public_port/path from a running pod (quickpod worker script)."""
+    """GET monitor path from a running pod; returns body or parenthesized error line."""
     ep = public_http_endpoint(pod, private_port)
     if not ep:
         return "(no public endpoint yet — pod may still be provisioning)\n"
@@ -265,10 +267,63 @@ def fetch_replica_http_log(
                 req.extensions = {**dict(req.extensions), **ex}
             r = c.send(req)
         if r.status_code != 200:
-            return f"(HTTP {r.status_code} from replica log endpoint)\n"
+            return f"(HTTP {r.status_code} from replica monitor endpoint)\n"
         return r.text
     except httpx.RequestError as e:
         return f"(could not reach {url}: {e})\n"
+
+
+def fetch_replica_http_log(
+    pod: dict[str, Any],
+    private_port: int,
+    path: str = MONITOR_LOGS_PATH,
+    *,
+    use_https: bool | None = None,
+    tls_insecure: bool | None = None,
+    timeout_sec: float = 8.0,
+    spec: ClusterSpec | None = None,
+) -> str:
+    """GET log text from the replica monitoring sidecar (default ``/quickpod/logs``)."""
+    return _fetch_replica_http_get(
+        pod,
+        private_port,
+        path,
+        use_https=use_https,
+        tls_insecure=tls_insecure,
+        timeout_sec=timeout_sec,
+        spec=spec,
+    )
+
+
+def fetch_replica_system_snapshot(
+    pod: dict[str, Any],
+    private_port: int,
+    path: str = MONITOR_SYSTEM_PATH,
+    *,
+    use_https: bool | None = None,
+    tls_insecure: bool | None = None,
+    timeout_sec: float = 8.0,
+    spec: ClusterSpec | None = None,
+) -> dict[str, Any]:
+    """GET JSON system metrics from the replica monitoring sidecar (default ``/quickpod/system``)."""
+    raw = _fetch_replica_http_get(
+        pod,
+        private_port,
+        path,
+        use_https=use_https,
+        tls_insecure=tls_insecure,
+        timeout_sec=timeout_sec,
+        spec=spec,
+    )
+    if raw.startswith("("):
+        return {"error": raw.strip()}
+    try:
+        out = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "invalid JSON from replica /quickpod/system", "raw_preview": raw[:400]}
+    if not isinstance(out, dict):
+        return {"error": "unexpected JSON type from replica /quickpod/system"}
+    return out
 
 
 def terminate_managed_pods(cluster_name: str, api_key: str | None = None) -> list[str]:

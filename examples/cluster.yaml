@@ -1,4 +1,4 @@
-# Minimal RunPod cluster with mTLS: quickpod injects Caddy + /quickpod-log when secure_mode is true.
+# Minimal RunPod cluster with mTLS: quickpod injects Caddy + /quickpod/logs + /quickpod/system when secure_mode is true.
 # Generate certs once: scripts/gen_mtls_certs.sh examples/mtls_smoke_certs
 # Your API must listen on 127.0.0.1:18000 (see quickpod.managed_worker.loopback_api_port).
 

@@ -18,6 +18,7 @@ from quickpod.runpod_client import (
     count_alive_nodes,
     count_ready_nodes,
     fetch_replica_http_log,
+    fetch_replica_system_snapshot,
     list_managed_pods,
 )
 from quickpod.spec import ClusterSpec, replica_log_http_port
@@ -48,6 +49,35 @@ def _tail_for_preview(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return "…(older log truncated)…\n" + text[-max_chars:]
+
+
+def _format_system_plain(s: Any) -> str:
+    """One-line summary for server-rendered dashboard cards (matches client ``formatSystem``)."""
+    if not isinstance(s, dict):
+        return "—"
+    err = s.get("error")
+    if err:
+        return str(err)[:320]
+    parts: list[str] = []
+    cpu = s.get("cpu") or {}
+    cp = cpu.get("percent")
+    if cp is not None:
+        parts.append(f"CPU {cp}%")
+    la = cpu.get("loadavg")
+    if isinstance(la, list) and la:
+        parts.append("load " + " ".join(f"{float(x):.2f}" for x in la[:3]))
+    mem = s.get("memory") or {}
+    mp = mem.get("used_percent")
+    if mp is not None:
+        parts.append(f"RAM {mp}% used")
+    for g in s.get("gpus") or []:
+        idx = g.get("index", 0)
+        gu = g.get("utilization_percent")
+        gm = g.get("memory_used_percent")
+        u = f"{gu}% util" if gu is not None else "util —"
+        v = f"{gm}% VRAM" if gm is not None else "VRAM —"
+        parts.append(f"GPU{idx} {u} · {v}")
+    return " · ".join(parts) if parts else "—"
 
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -127,6 +157,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       color: #c8d4e0;
     }}
     .meta {{ font-size: 0.75rem; color: var(--muted); padding: 0 0.85rem 0.65rem; }}
+    .sys-line {{
+      font-size: 0.78rem;
+      color: #a8b8cc;
+      padding: 0 0.85rem 0.5rem;
+      line-height: 1.4;
+      border-bottom: 1px solid var(--border);
+    }}
     footer {{ margin-top: 2rem; font-size: 0.75rem; color: var(--muted); }}
   </style>
 </head>
@@ -145,7 +182,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="grid" id="replica-grid">
     {replica_cards}
   </div>
-  <footer>quickpod · <code>/api/cluster</code> · replica logs: {log_footer} · workers reached over HTTPS by this service only</footer>
+  <footer>quickpod · <code>/api/cluster</code> · replica monitor: {log_footer} · workers reached over HTTPS by this service only</footer>
   <script>
 (function () {{
   const desired = parseInt(document.body.getAttribute('data-desired') || '0', 10);
@@ -172,6 +209,32 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     return '…(older log truncated)…\\n' + t.slice(-maxChars);
   }}
 
+  function formatSystem(s) {{
+    if (!s || typeof s !== 'object') return esc('—');
+    if (s.error) return esc(String(s.error));
+    const out = [];
+    const cpu = s.cpu || {{}};
+    if (cpu.percent != null) out.push('CPU ' + cpu.percent + '%');
+    const la = cpu.loadavg;
+    if (Array.isArray(la) && la.length) {{
+      const a = la.map(function (x) {{ return Number(x).toFixed(2); }}).join(' ');
+      out.push('load ' + a);
+    }}
+    const mem = s.memory || {{}};
+    if (mem.used_percent != null) out.push('RAM ' + mem.used_percent + '% used');
+    const gpus = s.gpus || [];
+    for (let i = 0; i < gpus.length; i++) {{
+      const g = gpus[i];
+      const gu = g.utilization_percent;
+      const gm = g.memory_used_percent;
+      const tag = 'GPU' + (g.index != null ? g.index : i);
+      const u = gu != null ? gu + '% util' : 'util —';
+      const v = gm != null ? gm + '% VRAM' : 'VRAM —';
+      out.push(tag + ' ' + u + ' · ' + v);
+    }}
+    return out.length ? esc(out.join(' · ')) : esc('—');
+  }}
+
   function scrollReplicaLogsToBottom() {{
     const grid = document.getElementById('replica-grid');
     if (!grid) return;
@@ -195,10 +258,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       const stCls = (r.status || '').toUpperCase() === 'RUNNING' ? 'st-running' : 'st-warn';
       const ep = r.endpoint ? esc(r.endpoint) : esc(r.endpoint_note || '—');
       const prev = esc(tailPreview(r.log_preview, 4000));
+      const sys = formatSystem(r.system);
       return (
         '<article>' +
           '<header><span>' + esc(r.name) + '</span><span class="' + stCls + '">' + esc(r.status) + '</span></header>' +
           '<div class="meta">id <code>' + esc(r.id) + '</code> · ' + ep + '</div>' +
+          '<div class="sys-line">' + sys + '</div>' +
           '<pre>' + prev + '</pre>' +
         '</article>'
       );
@@ -239,8 +304,8 @@ def build_app(
 ) -> FastAPI:
     http_port = replica_log_http_port(spec.resources)
     log_footer = (
-        f"port {http_port} → GET /quickpod-log (via quickpod → worker "
-        f"{'HTTPS+mTLS' if spec.resources.secure_mode else 'HTTP'})"
+        f"port {http_port} → <code>/quickpod/logs</code> & <code>/quickpod/system</code> "
+        f"(via quickpod → worker {'HTTPS+mTLS' if spec.resources.secure_mode else 'HTTP'})"
         if http_port is not None
         else "disabled (<code>replica_log_http: false</code>)"
     )
@@ -400,6 +465,25 @@ def build_app(
                 return PlainTextResponse(text)
         raise HTTPException(status_code=404, detail="pod not found")
 
+    @app.get("/api/replicas/{pod_id}/system")
+    def api_replica_system(pod_id: str) -> JSONResponse:
+        pods = list_managed_pods(spec.name, api_key=api_key)
+        for p in pods:
+            if str(p.get("id")) == pod_id:
+                if http_port is None:
+                    return JSONResponse(
+                        {"error": "replica monitor disabled in spec (resources.replica_log_http: false)"}
+                    )
+                data = fetch_replica_system_snapshot(
+                    p,
+                    http_port,
+                    use_https=spec.resources.secure_mode,
+                    tls_insecure=False,
+                    spec=spec,
+                )
+                return JSONResponse(data)
+        raise HTTPException(status_code=404, detail="pod not found")
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         snap = _snapshot()
@@ -415,10 +499,12 @@ def build_app(
             log_preview = html.escape(
                 _tail_for_preview(r["log_preview"], _LOG_PREVIEW_UI_MAX)
             )
+            sys_line = html.escape(_format_system_plain(r.get("system")))
             cards.append(
                 f"""<article>
   <header><span>{name}</span><span class="{st_cls}">{st}</span></header>
   <div class="meta">id <code>{pid}</code> · {ep_disp}</div>
+  <div class="sys-line">{sys_line}</div>
   <pre>{log_preview}</pre>
 </article>"""
             )
@@ -456,6 +542,7 @@ def _replica_view(
             "log_preview": (
                 "(replica log fetch disabled in spec — set resources.replica_log_http: true)\n"
             ),
+            "system": {"error": "replica monitor disabled in spec"},
         }
     use_https = spec.resources.secure_mode
     tls_insecure = False
@@ -467,6 +554,13 @@ def _replica_view(
         spec=spec,
     )
     preview = _tail_for_preview(preview, log_max)
+    system = fetch_replica_system_snapshot(
+        pod,
+        http_port,
+        use_https=use_https,
+        tls_insecure=tls_insecure,
+        spec=spec,
+    )
     return {
         "id": pid,
         "name": name,
@@ -474,4 +568,5 @@ def _replica_view(
         "endpoint": None,
         "endpoint_note": "API: use this host /v1 only (not worker IPs)",
         "log_preview": preview,
+        "system": system,
     }

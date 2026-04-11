@@ -39,7 +39,7 @@ def http_log_ok(pod: dict, private_port: int) -> bool:
     if not ep:
         return False
     host, port = ep
-    url = f"http://{host}:{port}/quickpod-log"
+    url = f"http://{host}:{port}/quickpod/logs"
     try:
         with urllib.request.urlopen(url, timeout=15.0) as r:
             body = r.read(512)
@@ -110,7 +110,7 @@ def main() -> None:
     gpu_type_id = resolve_gpu_type_id_for_spec(spec, api_key=key)
     reconcile_once(spec, key, gpu_type_id)
 
-    print("== 2) Wait until 2 pods RUNNING + TCP + HTTP /quickpod-log", flush=True)
+    print("== 2) Wait until 2 pods RUNNING + TCP + HTTP /quickpod/logs", flush=True)
     wait_two_ready_and_reachable(cluster, key, spec.num_nodes, private_port)
     pods_a = list_managed_pods(cluster, api_key=key)
     alive_a = count_alive_nodes(pods_a)

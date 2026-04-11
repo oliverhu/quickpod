@@ -82,19 +82,20 @@ class ResourcesSpec(BaseModel):
     replica_log_http: bool = Field(
         default=True,
         description=(
-            "If True, quickpod serve fetches GET /quickpod-log from replicas on "
-            "log_server_port (or the first port in ports). Set False for workloads "
-            "that do not expose that endpoint."
+            "If True, quickpod serve pulls replica monitoring from log_server_port and quickpod "
+            "injects the monitor in the container startup script (secure_mode or not): "
+            "GET /quickpod/logs (plain text) and GET /quickpod/system (JSON). Set False to skip "
+            "injection and dashboard fetches."
         ),
     )
     ports: list[int] = Field(
         default_factory=lambda: [8888, 8000],
-        description="Default includes 8888 for /quickpod-log sidecar and 8000 for typical APIs.",
+        description="Default includes 8888 for the monitoring sidecar and 8000 for typical APIs.",
     )
     log_server_port: int | None = Field(
         default=8888,
         description=(
-            "Container port where a replica serves GET /quickpod-log (plain text). "
+            "Container port where a replica serves GET /quickpod/logs and /quickpod/system. "
             "Must be listed in ports when replica_log_http is True. "
             "If null, the first entry in ports is used."
         ),
@@ -117,8 +118,8 @@ class ResourcesSpec(BaseModel):
     managed_log_file: str | None = Field(
         default=None,
         description=(
-            "Container path quickpod tees stdout/stderr to and the log sidecar serves via "
-            "/quickpod-log (default /workspace/replica.log when secure_mode is true)."
+            "Container path quickpod tees stdout/stderr to; the monitor serves it via "
+            "/quickpod/logs (default /workspace/replica.log when secure_mode is true)."
         ),
     )
     mtls: MtlsConfig = Field(
@@ -221,11 +222,21 @@ class ResourcesSpec(BaseModel):
                 raise ValueError(
                     "resources.mtls is only used when secure_mode: true (or remove mtls fields)"
                 )
+            if s.replica_log_http:
+                lp = replica_log_http_port(s)
+                wp = s.worker_api_port
+                if lp is not None and wp is not None and lp == wp:
+                    raise ValueError(
+                        "replica_log_http with secure_mode false requires distinct log and API "
+                        "ports: quickpod injects /quickpod/logs and /quickpod/system on the log "
+                        "port; bind your workload only on worker_api_port (see resources.ports, "
+                        "log_server_port, worker_api_port)."
+                    )
         return s
 
 
 def replica_log_http_port(resources: ResourcesSpec) -> int | None:
-    """Private port mapped for GET /quickpod-log on replicas, or None if disabled."""
+    """Private port mapped for GET /quickpod/logs and /quickpod/system on replicas, or None."""
     if not resources.replica_log_http:
         return None
     if resources.log_server_port is not None:

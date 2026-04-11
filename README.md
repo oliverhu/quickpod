@@ -7,6 +7,11 @@ I started with vast.ai as that is the cheapest offering I can find but its serve
 
 Then I looked into skypilot which is pretty neat. But it is a bit overkill, and doesn't provide something like load balancing/mTLS as first class. So I spent sometime vibe coding a simple remote GPU control plane. You will find some of the APIs similar to skypilot.
 
+
+![Top level view UI screenshot](docs/top_view.png)
+
+![Cluster details UI screenshot](docs/cluster_details.png)
+
 Basic functionalities:
 - *Simple YAML interface to define the cluster*. Like # of nodes, the ports exposed to your client. How to set up the env, what command to run after the setup is done.
 - *Naive load balancing*. A local quickpod service to provide a stable interface to remote GPU hosts. The local quickpod service will route request to the GPU hosts in the cluster in a round robin manner. (Optional) You can configure mTLS between local service and the remote GPU hosts to have better security.
@@ -176,6 +181,7 @@ Optional TLS for the **control UI only**: `--ssl-certfile` / `--ssl-keyfile` (se
 | `envs`                       | Env vars for the container (no `"` or newlines — RunPod GraphQL limit)                                                                                                                                        |
 | `setup` / `run`              | Startup scripts; see secure mode below                                                                                                                                                                        |
 
+## Secure Mode
 
 ### `secure_mode: false` (default)
 
@@ -203,7 +209,7 @@ Container entrypoint: `bash -lc "echo $ORCH_B64 | base64 -d | bash"`.
 
 ---
 
-## Kubernetes
+## Kubernetes (not validated)
 
 See `k8s/deployment.yaml`: build `Dockerfile`, push an image, create the `runpod-api-key` secret, apply.
 

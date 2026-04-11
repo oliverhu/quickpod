@@ -132,7 +132,7 @@ def http_json_ok(
         return None
 
 
-def worker_log_ok(
+def worker_monitor_ok(
     host: str,
     port: int,
     *,
@@ -142,7 +142,7 @@ def worker_log_ok(
     got = _worker_get(
         host,
         port,
-        "/quickpod-log",
+        "/quickpod/logs",
         use_https=use_https,
         spec=spec,
         timeout=25.0,
@@ -155,21 +155,29 @@ def worker_log_ok(
     if not body:
         return False
     bl = body.lower()
-    # Heuristic: replica log tee includes Caddy, nvidia-smi, bash, or our markers.
     markers = (
         b"quickpod",
         b"nvidia",
         b"smoke",
         b"(no log yet)",
+        b"(no log file yet)",
         b"caddy",
         b"cuda",
         b"listening",
         b"reverse_proxy",
     )
-    if any(m in bl for m in markers):
-        return True
-    # Any substantial plain-text log (startup noise) counts as alive.
-    return len(body) >= 64
+    log_ok = any(m in bl for m in markers) or len(body) >= 64
+    if not log_ok:
+        return False
+    sysj = http_json_ok(
+        host,
+        port,
+        "/quickpod/system",
+        use_https=use_https,
+        spec=spec,
+        timeout=25.0,
+    )
+    return bool(sysj and isinstance(sysj.get("cpu"), dict))
 
 
 def wait_workers_ready(
@@ -204,7 +212,7 @@ def wait_workers_ready(
                 continue
             if not tcp_check(log_ep[0], log_ep[1]) or not tcp_check(api_ep[0], api_ep[1]):
                 continue
-            if not worker_log_ok(
+            if not worker_monitor_ok(
                 log_ep[0],
                 log_ep[1],
                 use_https=use_https,
@@ -233,7 +241,7 @@ def wait_workers_ready(
         )
         time.sleep(poll_sec)
     raise TimeoutError(
-        f"workers not ready in {max_wait_sec}s (want {desired} with /quickpod-log + /v1/models via {scheme})"
+        f"workers not ready in {max_wait_sec}s (want {desired} with /quickpod/logs + /quickpod/system + /v1/models via {scheme})"
     )
 
 
