@@ -34,7 +34,7 @@ from quickpod.runpod_client import (
 )
 from quickpod.spec import ClusterSpec, replica_log_http_port
 from quickpod.worker_http import httpx_worker_client_kwargs, httpx_worker_tls_extensions
-from quickpod.worker_pool import WorkerRing, worker_base_urls
+from quickpod.worker_pool import WorkerRing, lb_ready_worker_bases, worker_base_urls
 
 _HOP_BY_HOP = frozenset(
     {
@@ -164,6 +164,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     }}
     .pill strong {{ display: block; font-size: 1.5rem; font-weight: 700; }}
     .pill span {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
+    .warn-banner {{
+      background: rgba(240, 193, 77, 0.12);
+      border: 1px solid var(--warn);
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      margin-bottom: 1.25rem;
+      font-size: 0.9rem;
+      color: var(--text);
+    }}
+    .warn-banner strong {{ color: var(--warn); }}
     .grid {{ display: grid; gap: 1rem; }}
     @media (min-width: 720px) {{ .grid {{ grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }} }}
     .section-title {{
@@ -232,6 +242,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="pill"><span>Alive (non-dead)</span><strong id="stat-alive">{alive} / {num_nodes}</strong></div>
     <div class="pill"><span>Managed pods</span><strong id="stat-managed">{managed}</strong></div>
   </div>
+  {lb_warn_banner}
   <div class="grid" id="replica-grid">
     {replica_cards}
   </div>
@@ -326,6 +337,19 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     document.getElementById('stat-ready').textContent = data.ready + ' / ' + (data.desired ?? desired);
     document.getElementById('stat-alive').textContent = data.alive + ' / ' + (data.desired ?? desired);
     document.getElementById('stat-managed').textContent = String((data.replicas || []).length);
+
+    const lbWarn = document.getElementById('lb-warn');
+    if (lbWarn) {{
+      if (data.proxy_unavailable_reason === 'no_healthy_workers') {{
+        const n = data.worker_endpoints_running != null ? data.worker_endpoints_running : '?';
+        lbWarn.style.display = 'block';
+        lbWarn.innerHTML = '<strong>/v1 unavailable</strong> — ' + n + ' worker endpoint(s) exist but none pass '
+          + '<code>/quickpod/status</code> (all <em>unhealthy</em> or <em>setting_up</em>). '
+          + 'OpenAI calls to <code>/v1</code> return <strong>503</strong> until at least one replica is ready.';
+      }} else {{
+        lbWarn.style.display = 'none';
+      }}
+    }}
 
     const grid = document.getElementById('replica-grid');
     const reps = data.replicas || [];
@@ -437,19 +461,28 @@ def build_app(
         pods = list_managed_pods(spec.name, api_key=api_key)
         alive = count_alive_nodes(pods)
         ready = count_ready_nodes(pods)
-        bases = worker_base_urls(spec, api_key, require_running=True)
+        running_bases = worker_base_urls(spec, api_key, require_running=True)
+        lb_bases = lb_ready_worker_bases(spec, api_key, require_running=True)
+        if lb_bases:
+            proxy_unavailable_reason: str | None = None
+        elif running_bases:
+            proxy_unavailable_reason = "no_healthy_workers"
+        else:
+            proxy_unavailable_reason = "no_running_endpoints"
         now = time.time()
         prev = _snapshot_last_logged.get(spec.name, 0.0)
         if now - prev >= _SNAPSHOT_LOG_INTERVAL_SEC:
             _snapshot_last_logged[spec.name] = now
             _log.info(
                 "dashboard snapshot: cluster=%s alive=%s ready=%s shortage_ready=%s "
-                "worker_backends=%s",
+                "lb_ready=%s running_endpoints=%s proxy_reason=%s",
                 spec.name,
                 alive,
                 ready,
                 max(0, spec.num_nodes - ready),
-                len(bases),
+                len(lb_bases),
+                len(running_bases),
+                proxy_unavailable_reason,
             )
         return {
             "cluster": spec.name,
@@ -462,7 +495,9 @@ def build_app(
             "replica_log_http": True,
             "replica_log_port": http_port,
             "openai_proxy_path": "/v1",
-            "worker_backends_ready": len(bases),
+            "worker_backends_ready": len(lb_bases),
+            "worker_endpoints_running": len(running_bases),
+            "proxy_unavailable_reason": proxy_unavailable_reason,
             "secure_mode": spec.resources.secure_mode,
             "local_service_log": get_quickpod_service_log_text(
                 max_chars=_LOCAL_SVC_LOG_SNAPSHOT_MAX
@@ -470,13 +505,32 @@ def build_app(
         }
 
     async def _proxy_v1(request: Request, path_fragment: str) -> Response:
-        bases = worker_base_urls(spec, api_key, require_running=True)
+        bases = lb_ready_worker_bases(spec, api_key, require_running=True)
         base = request.app.state.worker_ring.pick(bases)
         if not base:
+            running = worker_base_urls(spec, api_key, require_running=True)
+            if running:
+                return JSONResponse(
+                    {
+                        "detail": (
+                            "No healthy worker available for /v1: every RUNNING endpoint reports "
+                            "unhealthy or setting_up in GET /quickpod/status. Retry shortly."
+                        ),
+                        "cluster": spec.name,
+                        "reason": "no_healthy_workers",
+                        "running_endpoints": len(running),
+                    },
+                    status_code=503,
+                    headers={"Retry-After": "3"},
+                )
             return JSONResponse(
                 {
-                    "detail": "No RUNNING workers with a mapped API port — check cluster and RunPod.",
+                    "detail": (
+                        "No RUNNING worker with a mapped API port — check RunPod, cluster name, "
+                        "and that replicas have finished provisioning."
+                    ),
                     "cluster": spec.name,
+                    "reason": "no_running_endpoints",
                 },
                 status_code=503,
             )
@@ -639,6 +693,19 @@ def build_app(
                 _LOCAL_SVC_LOG_UI_MAX,
             )
         )
+        if snap.get("proxy_unavailable_reason") == "no_healthy_workers":
+            n = int(snap.get("worker_endpoints_running") or 0)
+            lb_warn_banner = (
+                '<div class="warn-banner" id="lb-warn" style="display:block">'
+                "<strong>/v1 unavailable</strong> — "
+                f"{n} worker endpoint(s) exist but none pass "
+                r"<code>/quickpod/status</code> (all <em>unhealthy</em> or <em>setting_up</em>). "
+                "OpenAI calls to <code>/v1</code> return <strong>503</strong> until at least one "
+                "replica is ready.</div>"
+            )
+        else:
+            lb_warn_banner = '<div class="warn-banner" id="lb-warn" style="display:none"></div>'
+
         return _DASHBOARD_HTML.format(
             cluster_name=html.escape(spec.name),
             num_nodes=spec.num_nodes,
@@ -649,6 +716,7 @@ def build_app(
             local_service_log=local_log,
             log_footer=log_footer,
             api_prefix=html.escape(public_path_prefix or "", quote=True),
+            lb_warn_banner=lb_warn_banner,
         )
 
     return app
