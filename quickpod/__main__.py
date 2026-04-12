@@ -24,6 +24,7 @@ from quickpod.runpod_client import (
 )
 from quickpod.serve_daemon_mgmt import (
     pick_free_port,
+    refresh_cluster_run_swap,
     refresh_cluster_serve,
     remove_cluster_completely,
     serve_public_base_url,
@@ -186,6 +187,14 @@ def main() -> None:
         type=str,
         help="Cluster name (same as the YAML `name` field)",
     )
+    ref.add_argument(
+        "--swap",
+        action="store_true",
+        help=(
+            "Do not reprovision: restart only the workload ``run`` on each RUNNING replica "
+            "from the current on-disk YAML (update the file first)"
+        ),
+    )
 
     args = p.parse_args()
     key = require_runpod_api_key()
@@ -310,6 +319,27 @@ def main() -> None:
         return
 
     if args.cmd == "refresh":
+        if args.swap:
+            try:
+                rows = refresh_cluster_run_swap(
+                    args.cluster_name, key, database_url=args.database_url
+                )
+            except (RuntimeError, ValueError) as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(2)
+            print(
+                f"Swapped run on {len(rows)} replica(s) for {args.cluster_name!r} "
+                "(no reprovision).",
+                flush=True,
+            )
+            for row in rows:
+                rid = row.get("pod_id") or "?"
+                res = row.get("result") or {}
+                ok = res.get("ok")
+                err = res.get("error")
+                extra = f" error={err!r}" if err else ""
+                print(f"  pod {rid}: ok={ok}{extra}", flush=True)
+            return
         try:
             name, pid = refresh_cluster_serve(
                 args.cluster_name, key, database_url=args.database_url

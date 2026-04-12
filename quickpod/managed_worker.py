@@ -144,11 +144,13 @@ def _mtls_embed_lines(resources: ResourcesSpec) -> list[str]:
     return lines
 
 
-_MONITOR_HTTP_PY_TEMPLATE = r'''import csv
+_MONITOR_HTTP_PY_TEMPLATE = r'''import base64
+import csv
 import io
 import json
 import os
 import pathlib
+import signal
 import socket
 import socketserver
 import subprocess
@@ -163,7 +165,6 @@ HEALTH_ENABLED = __HEALTH_ENABLED__
 HEALTH_TIMEOUT = __HEALTH_TIMEOUT__
 HEALTH_INTERVAL = __HEALTH_INTERVAL__
 if HEALTH_ENABLED:
-    import base64
     _hb64 = __HEALTH_B64_REPR__
     HEALTH_CMD = base64.b64decode(_hb64.encode("ascii")).decode("utf-8")
 else:
@@ -383,9 +384,107 @@ def _system_json():
     }
 
 
+def _kill_workload_on_loopback_api():
+    """Workload (secure_mode) listens on 127.0.0.1:18000; killing the shell PID may leave Python bound."""
+    import re as _re
+
+    port = 18000
+    fuser = "/usr/bin/fuser"
+    if os.path.isfile(fuser):
+        subprocess.run([fuser, "-k", f"{port}/tcp"], timeout=25, capture_output=True)
+        time.sleep(0.45)
+        return
+    try:
+        out = subprocess.check_output(["ss", "-tlnp"], text=True, timeout=8, stderr=subprocess.DEVNULL)
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return
+    for line in out.splitlines():
+        if f":{port} " not in line and f":{port}\n" not in line and f":{port}\t" not in line:
+            continue
+        if "127.0.0.1" not in line:
+            continue
+        for m in _re.finditer(r"pid=(\d+)", line):
+            try:
+                os.kill(int(m.group(1)), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+    time.sleep(0.45)
+
+
+def _perform_swap_run(raw: bytes):
+    obj = json.loads(raw.decode("utf-8"))
+    rb = obj.get("run_b64")
+    if not isinstance(rb, str) or not rb.strip():
+        return {"ok": False, "error": "missing run_b64"}
+    try:
+        user_run = base64.b64decode(rb.encode("ascii")).decode("utf-8")
+    except Exception as e:
+        return {"ok": False, "error": "invalid run_b64: %s" % (e,)}
+    if not user_run.strip():
+        return {"ok": False, "error": "empty run script after decode"}
+    pid_path = pathlib.Path("/workspace/quickpod-workload.pid")
+    if pid_path.exists():
+        try:
+            old = int(pid_path.read_text(encoding="utf-8").strip())
+            try:
+                os.kill(old, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            time.sleep(0.85)
+            try:
+                os.kill(old, 0)
+                os.kill(old, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    _kill_workload_on_loopback_api()
+    script = "/workspace/quickpod-swap-run.sh"
+    pathlib.Path(script).write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n" + user_run + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(script, 0o755)
+    logf = open("/workspace/replica.log", "a", buffering=1)
+    proc = subprocess.Popen(
+        ["/bin/bash", script],
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    return {"ok": True, "pid": proc.pid}
+
+
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         return
+
+    def do_POST(self):
+        p = _norm_path(self.path)
+        if p != "/quickpod/swap-run":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n else b""
+        try:
+            out = _perform_swap_run(raw)
+            st = 200 if out.get("ok") else 400
+            b = json.dumps(out).encode("utf-8")
+            self.send_response(st)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b)
+        except Exception as e:
+            msg = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(msg)
 
     def do_GET(self):
         p = _norm_path(self.path)
@@ -537,6 +636,7 @@ def managed_user_run_wait_caddy(user_run: str) -> str:
             "(",
             ur,
             ") &",
+            "echo $! > /workspace/quickpod-workload.pid",
             'wait "${CADDY_PID:?quickpod: CADDY_PID unset (caddy did not start)}"',
         ]
     )
@@ -557,8 +657,11 @@ def build_container_startup_script(spec: ClusterSpec) -> str:
             + "\n"
             + _shell_write_lifecycle("running")
             + "\n"
+            + "(\n"
             + spec.run.strip()
-            + "\n"
+            + "\n) &\n"
+            + "echo $! > /workspace/quickpod-workload.pid\n"
+            + "wait $!\n"
         )
 
     managed_worker_validate(spec.resources)

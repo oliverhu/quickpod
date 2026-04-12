@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import signal
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from quickpod.cluster_store import (
     delete_cluster_record,
@@ -21,8 +23,14 @@ from quickpod.cluster_store import (
     upsert_serve_launch_prefs,
 )
 from quickpod.reconciler import reconcile_once
-from quickpod.runpod_client import configure_api, resolve_gpu_type_id_for_spec, terminate_managed_pods
-from quickpod.spec import load_spec
+from quickpod.runpod_client import (
+    configure_api,
+    list_managed_pods,
+    post_replica_swap_run,
+    resolve_gpu_type_id_for_spec,
+    terminate_managed_pods,
+)
+from quickpod.spec import load_spec, replica_log_http_port
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +230,77 @@ def start_serve_daemon(
     return spec.name, proc.pid
 
 
+def resolve_spec_path_for_cluster(
+    cluster_name: str, *, database_url: str | None = None
+) -> str:
+    """Resolve on-disk YAML for refresh/swap.
+
+    Prefer ``clusters.spec_path`` (last ``reconcile`` / ``upsert_cluster_touch``) so edits
+    match what operators expect; fall back to ``serve_launch_prefs`` from ``quickpod serve``.
+    """
+    cr = get_cluster_record(cluster_name, database_url=database_url)
+    sp = (cr or {}).get("spec_path")
+    if sp and Path(str(sp)).is_file():
+        return str(Path(str(sp)).resolve())
+    prefs = get_serve_launch_prefs(cluster_name, database_url=database_url)
+    if prefs is not None:
+        pp = prefs.get("spec_path")
+        if pp and Path(str(pp)).is_file():
+            return str(Path(str(pp)).resolve())
+    raise RuntimeError(
+        f"No saved spec YAML for {cluster_name!r}. Run "
+        f"`quickpod reconcile --spec <path/to/{cluster_name}.yaml> ...` or "
+        f"`quickpod serve --spec <path/...> ...` once first."
+    )
+
+
+def refresh_cluster_run_swap(
+    cluster_name: str,
+    api_key: str,
+    *,
+    database_url: str | None = None,
+) -> list[dict[str, Any]]:
+    """For each RUNNING replica, POST ``/quickpod/swap-run`` with ``run`` from the saved YAML (no reprovision).
+
+    Update the YAML on disk before calling; this reloads it and pushes ``run`` to workers.
+    """
+    spec_path_abs = resolve_spec_path_for_cluster(cluster_name, database_url=database_url)
+    if not Path(spec_path_abs).is_file():
+        raise RuntimeError(f"Spec path does not exist: {spec_path_abs}")
+
+    spec = load_spec(spec_path_abs)
+    if spec.name != cluster_name:
+        raise RuntimeError(
+            f"YAML at {spec_path_abs!r} has name={spec.name!r} but you asked to refresh "
+            f"{cluster_name!r}."
+        )
+    configure_api(api_key)
+    http_port = replica_log_http_port(spec.resources)
+    run_b64 = base64.b64encode(spec.run.encode()).decode("ascii")
+    pods = list_managed_pods(cluster_name, api_key=api_key)
+    results: list[dict[str, Any]] = []
+    for p in pods:
+        if (p.get("desiredStatus") or "").upper() != "RUNNING":
+            continue
+        out = post_replica_swap_run(
+            p,
+            http_port,
+            run_b64,
+            use_https=spec.resources.secure_mode,
+            tls_insecure=False,
+            spec=spec,
+            cluster_name=cluster_name,
+            api_key=api_key,
+        )
+        pid = p.get("id")
+        results.append({"pod_id": str(pid) if pid else "", "result": out})
+    if not results:
+        raise RuntimeError(
+            f"No RUNNING pods for {cluster_name!r} to swap — check RunPod."
+        )
+    return results
+
+
 def refresh_cluster_serve(
     cluster_name: str,
     api_key: str,
@@ -229,24 +308,17 @@ def refresh_cluster_serve(
     database_url: str | None = None,
 ) -> tuple[str, int]:
     """Stop RunPod pods + local proxy for ``cluster_name``, then start serve from saved YAML path and options."""
+    spec_path_abs = resolve_spec_path_for_cluster(cluster_name, database_url=database_url)
     prefs = get_serve_launch_prefs(cluster_name, database_url=database_url)
     if prefs is None:
-        cr = get_cluster_record(cluster_name, database_url=database_url)
-        sp = (cr or {}).get("spec_path")
-        if not sp or not Path(sp).is_file():
-            raise RuntimeError(
-                f"No saved serve settings for {cluster_name!r}. Run "
-                f"`quickpod serve --spec <path/to/{cluster_name}.yaml> ...` once first."
-            )
         prefs = {
-            "spec_path": str(Path(sp).resolve()),
+            "spec_path": spec_path_abs,
             "host": "0.0.0.0",
             "port": pick_free_port("0.0.0.0"),
             "ssl_certfile": None,
             "ssl_keyfile": None,
         }
 
-    spec_path_abs = str(Path(prefs["spec_path"]).resolve())
     if not Path(spec_path_abs).is_file():
         raise RuntimeError(f"Saved spec path does not exist: {spec_path_abs}")
 

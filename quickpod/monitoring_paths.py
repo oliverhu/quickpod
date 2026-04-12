@@ -6,3 +6,4 @@ from __future__ import annotations
 MONITOR_LOGS_PATH = "/quickpod/logs"
 MONITOR_SYSTEM_PATH = "/quickpod/system"
 MONITOR_STATUS_PATH = "/quickpod/status"
+MONITOR_SWAP_RUN_PATH = "/quickpod/swap-run"

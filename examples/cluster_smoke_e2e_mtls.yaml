@@ -17,6 +17,7 @@ reconcile_interval_seconds: 60
 
 resources:
   compute_type: GPU
+  cloud_type: COMMUNITY
   image: python:3.11-slim-bookworm
   gpu: RTX3090
   gpu_count: 1
@@ -43,7 +44,7 @@ resources:
 envs: {}
 
 setup: |
-  apt-get update -qq && apt-get install -y -qq curl ca-certificates || true
+  apt-get update -qq && apt-get install -y -qq curl ca-certificates psmisc || true
 
 run: |
   python3 -u <<'QPMOCK'

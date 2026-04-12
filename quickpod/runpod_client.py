@@ -16,7 +16,12 @@ from runpod.error import QueryError
 
 from quickpod.graphql_pod import deploy_gpu_pod
 from quickpod.managed_worker import build_container_startup_script
-from quickpod.monitoring_paths import MONITOR_LOGS_PATH, MONITOR_STATUS_PATH, MONITOR_SYSTEM_PATH
+from quickpod.monitoring_paths import (
+    MONITOR_LOGS_PATH,
+    MONITOR_STATUS_PATH,
+    MONITOR_SWAP_RUN_PATH,
+    MONITOR_SYSTEM_PATH,
+)
 from quickpod.spec import ClusterSpec, replica_log_http_port
 from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
 
@@ -401,6 +406,92 @@ def _fetch_replica_http_get(
         return r.text
     except httpx.RequestError as e:
         return f"(could not reach {url}: {e})\n"
+
+
+def post_replica_swap_run(
+    pod: dict[str, Any],
+    private_port: int,
+    run_b64: str,
+    *,
+    use_https: bool | None = None,
+    tls_insecure: bool | None = None,
+    timeout_sec: float = 120.0,
+    spec: ClusterSpec | None = None,
+    cluster_name: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """POST ``/quickpod/swap-run`` to kill the current ``run`` process and start a new script (same pod)."""
+    work_pod = pod
+    if spec is not None and spec.resources.secure_mode and spec.resources.worker_api_port is not None:
+        private_port = int(spec.resources.worker_api_port)
+
+    def _resolve_ep(p: dict[str, Any]) -> tuple[str, int] | None:
+        if spec is not None:
+            return resolve_replica_monitor_public_endpoint(p, spec, private_port)
+        return public_http_endpoint(p, private_port)
+
+    ep = _resolve_ep(work_pod)
+    if not ep and cluster_name and api_key and work_pod.get("id"):
+        time.sleep(0.35)
+        fresh = _refresh_pod_by_id(cluster_name, str(work_pod["id"]), api_key=api_key)
+        if fresh is not None:
+            work_pod = fresh
+            ep = _resolve_ep(work_pod)
+    if not ep:
+        return {"ok": False, "error": "no public endpoint for replica monitor"}
+    host, port = ep
+    if use_https is None:
+        if spec is not None:
+            use_https = bool(spec.resources.secure_mode)
+        else:
+            use_https = os.environ.get("QUICKPOD_REPLICA_USE_HTTPS", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+    if tls_insecure is None:
+        tls_insecure = os.environ.get("QUICKPOD_REPLICA_TLS_INSECURE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    url = f"{'https' if use_https else 'http'}://{host}:{port}{MONITOR_SWAP_RUN_PATH}"
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if spec is not None and use_https and spec.resources.secure_mode:
+        headers["Host"] = f"localhost:{port}"
+    if spec is not None and spec.resources.secure_mode:
+        tls_kw = httpx_log_fetch_kwargs(spec)
+    else:
+        verify = True
+        if use_https and tls_insecure:
+            verify = False
+        tls_kw = {"verify": verify if use_https else True, "cert": None}
+    body = json.dumps({"run_b64": run_b64})
+    try:
+        with httpx.Client(
+            timeout=timeout_sec,
+            http2=False,
+            trust_env=False,
+            headers=headers,
+            **tls_kw,
+        ) as c:
+            req = c.build_request("POST", url, content=body.encode("utf-8"))
+            ex = httpx_worker_tls_extensions(spec) if spec is not None else {}
+            if ex:
+                req.extensions = {**dict(req.extensions), **ex}
+            r = c.send(req)
+        try:
+            out = json.loads(r.text)
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "error": f"invalid JSON (HTTP {r.status_code}): {r.text[:400]}",
+            }
+        if isinstance(out, dict):
+            out["_http_status"] = r.status_code
+        return out if isinstance(out, dict) else {"ok": False, "error": str(out)}
+    except httpx.RequestError as e:
+        return {"ok": False, "error": f"request failed: {e}"}
 
 
 def fetch_replica_http_log(

@@ -45,6 +45,7 @@ import yaml
 from starlette.testclient import TestClient
 
 from quickpod.cluster_store import delete_cluster_record, resolve_database_url
+from quickpod.serve_daemon_mgmt import refresh_cluster_run_swap
 from quickpod.runtime_env import require_runpod_api_key
 from quickpod.reconciler import reconcile_once, run_loop_until
 from quickpod.serve_runner import run_serve
@@ -458,7 +459,7 @@ def main() -> int:
         print(f"    ready count={ready}", flush=True)
 
         print("== 3) TestClient: /api/cluster + /v1/models via proxy", flush=True)
-        app = build_app(spec, key)
+        app = build_app(spec, key, database_url=db_url)
         with TestClient(app) as client:
             snap: dict | None = None
             for attempt in range(30):
@@ -503,6 +504,57 @@ def main() -> int:
             if body.get("object") != "list" or not body.get("data"):
                 print(f"FAIL unexpected /v1/models JSON: {body!r}", file=sys.stderr)
                 return 1
+
+            spec_yaml_path = Path(spec_path_abs)
+            if use_https and spec_yaml_path.is_file():
+                yaml_raw = spec_yaml_path.read_text(encoding="utf-8")
+                # Temp YAML from prepare_spec_path may reformat quotes; match the stable substring only.
+                if (
+                    "owned_by" in yaml_raw
+                    and "quickpod-smoke-mtls" in yaml_raw
+                    and "quickpod-smoke-mtls-SWAP" not in yaml_raw
+                ):
+                    print("== 3b) refresh --swap (restart run on replicas, no reprovision)", flush=True)
+                    yaml_swap = yaml_raw.replace(
+                        "quickpod-smoke-mtls",
+                        "quickpod-smoke-mtls-SWAP",
+                        1,
+                    )
+                    spec_yaml_path.write_text(yaml_swap, encoding="utf-8")
+                    try:
+                        swap_rows = refresh_cluster_run_swap(
+                            cluster, key, database_url=db_url
+                        )
+                    except Exception as e:
+                        spec_yaml_path.write_text(yaml_raw, encoding="utf-8")
+                        print(f"FAIL refresh --swap: {e}", file=sys.stderr)
+                        return 1
+                    for row in swap_rows:
+                        res = row.get("result") or {}
+                        if not res.get("ok"):
+                            spec_yaml_path.write_text(yaml_raw, encoding="utf-8")
+                            print(
+                                f"FAIL swap replica {row.get('pod_id')}: {res!r}",
+                                file=sys.stderr,
+                            )
+                            return 1
+                    for attempt in range(40):
+                        pr2 = client.get("/v1/models")
+                        if pr2.status_code == 200 and "SWAP" in pr2.text:
+                            print(
+                                "    refresh --swap verified (model owned_by contains SWAP)",
+                                flush=True,
+                            )
+                            break
+                        time.sleep(2.0)
+                    else:
+                        spec_yaml_path.write_text(yaml_raw, encoding="utf-8")
+                        print(
+                            "FAIL: /v1/models after swap missing SWAP marker",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    spec_yaml_path.write_text(yaml_raw, encoding="utf-8")
 
             pod_ids = [str(rp["id"]) for rp in snap["replicas"] if rp.get("id")]
             if pod_ids:
