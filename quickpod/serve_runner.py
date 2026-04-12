@@ -16,14 +16,13 @@ def run_serve(
     *,
     host: str = "0.0.0.0",
     port: int = 8765,
-    reconcile: bool = False,
     spec_path: str | None = None,
     database_url: str | None = None,
     ssl_certfile: str | None = None,
     ssl_keyfile: str | None = None,
     log_level: str = "info",
 ) -> None:
-    """Run the dashboard + /v1 proxy. If ``reconcile`` is True, start the same background loop as ``quickpod serve --reconcile``."""
+    """Run the dashboard + /v1 proxy and a background reconcile loop (same spec, ``reconcile_interval_seconds``)."""
     if (ssl_certfile or ssl_keyfile) and not (ssl_certfile and ssl_keyfile):
         print(
             "Both ssl_certfile and ssl_keyfile are required for HTTPS.",
@@ -31,22 +30,20 @@ def run_serve(
         )
         raise SystemExit(2)
 
-    stop_rc: threading.Event | None = None
-    if reconcile:
-        stop_rc = threading.Event()
-        rc_thread = threading.Thread(
-            target=functools.partial(
-                run_loop_until,
-                spec,
-                api_key,
-                stop_rc,
-                spec_path=spec_path,
-                database_url=database_url,
-            ),
-            name="quickpod-reconcile",
-            daemon=True,
-        )
-        rc_thread.start()
+    stop_rc = threading.Event()
+    rc_thread = threading.Thread(
+        target=functools.partial(
+            run_loop_until,
+            spec,
+            api_key,
+            stop_rc,
+            spec_path=spec_path,
+            database_url=database_url,
+        ),
+        name="quickpod-reconcile",
+        daemon=True,
+    )
+    rc_thread.start()
 
     import uvicorn
 
@@ -65,5 +62,4 @@ def run_serve(
             kw["ssl_keyfile"] = ssl_keyfile
         uvicorn.run(**kw)
     finally:
-        if stop_rc is not None:
-            stop_rc.set()
+        stop_rc.set()

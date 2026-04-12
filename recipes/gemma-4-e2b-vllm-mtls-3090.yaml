@@ -12,7 +12,7 @@
 
 name: recipe-gemma-4-e2b-mtls
 num_nodes: 2
-reconcile_interval_seconds: 120
+reconcile_interval_seconds: 30
 
 resources:
   compute_type: GPU

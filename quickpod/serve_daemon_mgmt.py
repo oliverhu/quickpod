@@ -142,7 +142,6 @@ def start_serve_daemon(
     *,
     host: str = "0.0.0.0",
     port: int = 8765,
-    reconcile: bool = False,
     database_url: str | None = None,
     ssl_certfile: str | None = None,
     ssl_keyfile: str | None = None,
@@ -181,7 +180,6 @@ def start_serve_daemon(
     env["QUICKPOD_SERVE_SPEC_PATH"] = sp
     env["QUICKPOD_SERVE_HOST"] = host
     env["QUICKPOD_SERVE_PORT"] = str(port)
-    env["QUICKPOD_SERVE_RECONCILE"] = "1" if reconcile else "0"
     if database_url:
         env["QUICKPOD_DATABASE_URL"] = database_url
     if ssl_certfile:
@@ -217,7 +215,6 @@ def start_serve_daemon(
         spec_path=sp,
         host=host,
         port=port,
-        reconcile=reconcile,
         ssl_certfile=ssl_certfile,
         ssl_keyfile=ssl_keyfile,
         database_url=database_url,
@@ -245,7 +242,6 @@ def refresh_cluster_serve(
             "spec_path": str(Path(sp).resolve()),
             "host": "0.0.0.0",
             "port": pick_free_port("0.0.0.0"),
-            "reconcile": False,
             "ssl_certfile": None,
             "ssl_keyfile": None,
         }
@@ -267,7 +263,6 @@ def refresh_cluster_serve(
         api_key,
         host=str(prefs["host"]),
         port=int(prefs["port"]),
-        reconcile=bool(prefs.get("reconcile")),
         database_url=database_url,
         ssl_certfile=prefs.get("ssl_certfile"),
         ssl_keyfile=prefs.get("ssl_keyfile"),

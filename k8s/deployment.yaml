@@ -22,7 +22,6 @@ data:
       image: runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel
       gpu: RTX4090
       gpu_count: 1
-      replica_log_http: false
       ports: [8000]
       cloud_type: SECURE
       zones: [US-IL-1]

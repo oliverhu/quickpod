@@ -31,7 +31,20 @@ _ALIVE_STATUSES = frozenset(
         "STARTING",
     }
 )
-_DEAD_STATUSES = frozenset({"EXITED", "TERMINATED", "STOPPED", "FAILED"})
+# Include transitional states so terminating pods do not block replacement launches.
+_DEAD_STATUSES = frozenset(
+    {
+        "EXITED",
+        "TERMINATED",
+        "TERMINATING",
+        "STOPPED",
+        "STOPPING",
+        "FAILED",
+        "CANCELLED",
+        "CANCELED",
+        "DELETING",
+    }
+)
 _READY_STATUSES = frozenset({"RUNNING"})
 
 
@@ -169,13 +182,24 @@ def list_managed_pods(
 
 
 def count_alive_nodes(pods: list[dict[str, Any]]) -> int:
+    """Pods that still occupy a replica slot (not dead / not done terminating).
+
+    Only known provisioning/running states count. Unknown ``desiredStatus`` values are
+    ignored so a bad API value cannot block scale-up indefinitely.
+    """
     n = 0
     for p in pods:
         st = (p.get("desiredStatus") or "").upper()
         if st in _DEAD_STATUSES:
             continue
-        if st in _ALIVE_STATUSES or (st and st not in _DEAD_STATUSES):
+        if st in _ALIVE_STATUSES:
             n += 1
+        elif st:
+            logger.debug(
+                "count_alive_nodes: ignoring pod id=%r unknown desiredStatus=%r",
+                p.get("id"),
+                st,
+            )
     return n
 
 
@@ -251,10 +275,12 @@ def _runtime_private_ports(pod: dict[str, Any]) -> list[int]:
 
 def infer_replica_monitor_private_port(pod: dict[str, Any], spec: ClusterSpec) -> int | None:
     """When spec quickpod port does not match RunPod mappings, infer sidecar private port from runtime."""
+    if spec.resources.secure_mode:
+        # Secure clusters expose /quickpod/* only on worker_api_port; older runtime rows may list a
+        # stale second private port with no listener — never infer that for mTLS.
+        return None
     wp = spec.resources.worker_api_port
     preferred = replica_log_http_port(spec.resources)
-    if preferred is None:
-        return None
     privs = _runtime_private_ports(pod)
     non_std = [p for p in privs if wp is None or p != wp]
     non_std = [p for p in non_std if p != 22]
@@ -278,9 +304,13 @@ def resolve_replica_monitor_public_endpoint(
     preferred_private: int,
 ) -> tuple[str, int] | None:
     """Resolve (host, public_port) for replica monitor HTTPS/HTTP, with inference + alternate keys."""
+    if spec.resources.secure_mode and spec.resources.worker_api_port is not None:
+        preferred_private = int(spec.resources.worker_api_port)
     ep = public_http_endpoint(pod, preferred_private)
     if ep:
         return ep
+    if spec.resources.secure_mode:
+        return None
     alt = infer_replica_monitor_private_port(pod, spec)
     if alt is not None:
         ep = public_http_endpoint(pod, alt)
@@ -312,6 +342,8 @@ def _fetch_replica_http_get(
 ) -> str:
     """GET monitor path from a running pod; returns body or parenthesized error line."""
     work_pod = pod
+    if spec is not None and spec.resources.secure_mode and spec.resources.worker_api_port is not None:
+        private_port = int(spec.resources.worker_api_port)
 
     def _resolve_ep(p: dict[str, Any]) -> tuple[str, int] | None:
         if spec is not None:

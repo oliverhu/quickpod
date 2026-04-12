@@ -95,7 +95,10 @@ def main() -> None:
 
     s = sub.add_parser(
         "serve",
-        help="Reconcile once, then OpenAI proxy + per-cluster UI (detached daemon unless --foreground)",
+        help=(
+            "Reconcile once, then OpenAI proxy + per-cluster UI with a background reconcile loop "
+            "(detached daemon unless --foreground)"
+        ),
     )
     s.add_argument("--spec", type=str, required=True, help="Path to cluster YAML")
     s.add_argument(
@@ -122,11 +125,6 @@ def main() -> None:
         type=str,
         default=None,
         help="PEM private key for HTTPS (use with --ssl-certfile)",
-    )
-    s.add_argument(
-        "--reconcile",
-        action="store_true",
-        help="Run reconcile loop in a background thread (same spec)",
     )
     s.add_argument(
         "--foreground",
@@ -264,7 +262,6 @@ def main() -> None:
                 spec_path=spec_path_abs,
                 host=args.host,
                 port=port,
-                reconcile=args.reconcile,
                 ssl_certfile=args.ssl_certfile,
                 ssl_keyfile=args.ssl_keyfile,
                 database_url=args.database_url,
@@ -286,7 +283,6 @@ def main() -> None:
                 key,
                 host=args.host,
                 port=port,
-                reconcile=args.reconcile,
                 spec_path=spec_path_abs,
                 database_url=args.database_url,
                 ssl_certfile=args.ssl_certfile,
@@ -299,7 +295,6 @@ def main() -> None:
                     key,
                     host=args.host,
                     port=port,
-                    reconcile=args.reconcile,
                     database_url=args.database_url,
                     ssl_certfile=args.ssl_certfile,
                     ssl_keyfile=args.ssl_keyfile,

@@ -72,7 +72,7 @@ Use `resourcesGpu` as a hint for `resources.gpu` in your spec. Capacity varies b
 uv run quickpod serve --spec examples/cluster_smoke_e2e_mtls.yaml
 ```
 
-By default this runs **one reconcile** (register cluster, launch pods), then starts a **background daemon** with a random HTTP port. The command prints:
+By default this runs **one reconcile** (register cluster, launch pods), then starts a **background daemon** with a random HTTP port. The serve process also runs a **background reconcile loop** (same spec, `reconcile_interval_seconds`) so desired replica count stays enforced. The command prints:
 
 - **OpenAI base URL** — e.g. `http://127.0.0.1:<port>/v1`  
 - **Cluster UI** — same origin as that base URL
@@ -165,7 +165,7 @@ Until vLLM is ready, **`/v1/models`** may briefly return **502** from the worker
 | -------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | `quickpod validate [--spec FILE]`                                    | Check API key; optional GPU resolution                           |
 | `quickpod list-gpus`                                                 | JSON: id, displayName, `resourcesGpu`, memory, `communityPrice`  |
-| `quickpod serve --spec FILE [--port N] [--foreground] [--reconcile]` | Reconcile once + local `/v1` + UI (daemon unless `--foreground`) |
+| `quickpod serve --spec FILE [--port N] [--foreground]` | Reconcile once + background reconcile loop + local `/v1` + UI (daemon unless `--foreground`) |
 | `quickpod refresh <name>`                                            | Stop cluster + restart `serve` from saved YAML/options           |
 | `quickpod ui [--port 8780]`                                          | Hub listing all clusters                                         |
 | `quickpod clusters list [--json]`                                    | Table of clusters + live RunPod status                           |
@@ -180,6 +180,7 @@ Until vLLM is ready, **`/v1/models`** may briefly return **502** from the worker
 
 ## `quickpod serve` behavior
 
+- **Background reconcile** — same loop as `quickpod reconcile` (interval from `reconcile_interval_seconds` in the YAML), so the cluster is continuously driven toward `num_nodes`.
 - **Dashboard** (`/`) — status and replica log previews (HTTP or HTTPS+mTLS to workers per `secure_mode`).  
 - `**/api/cluster`** — JSON snapshot (polled every 5s in the UI).  
 - `**/v1/...**` — Reverse proxy to **RUNNING** workers (round-robin), TLS client auth when the spec uses mTLS.
@@ -198,7 +199,7 @@ Optional TLS for the **control UI only**: `--ssl-certfile` / `--ssl-keyfile` (se
 | `name`                       | Cluster id; pods are named `{name}-{8 hex}`                                                                                                                                                                   |
 | `num_nodes`                  | Desired instance count                                                                                                                                                                                        |
 | `reconcile_interval_seconds` | Sleep between reconcile passes in a loop                                                                                                                                                                      |
-| `resources`                  | `image`, `gpu`, `gpu_count`, `ports`, `replica_log_http`, `quickpod_service_port` (optional random default), `worker_api_port`, `secure_mode`, `mtls` (if secure), optional `managed_log_file`, `cloud_type`, `zones`, `container_disk_in_gb` |
+| `resources`                  | `image`, `gpu`, `gpu_count`, `ports`, `quickpod_service_port` (optional random default), `worker_api_port`, `secure_mode`, `mtls` (if secure), optional `managed_log_file`, `cloud_type`, `zones`, `container_disk_in_gb` |
 | `envs`                       | Env vars for the container (no `"` or newlines — RunPod GraphQL limit)                                                                                                                                        |
 | `setup` / `run`              | Startup scripts; see secure mode below                                                                                                                                                                        |
 
@@ -208,11 +209,11 @@ Legacy YAML may still use `log_server_port`; it is read as `quickpod_service_por
 
 ### `secure_mode: false` (default)
 
-Plain HTTP from quickpod to workers. Your `setup` / `run` run as-is; you bind services yourself (e.g. `0.0.0.0`). See `examples/cluster_test_3090.yaml`.
+Plain HTTP from quickpod to workers. quickpod injects `/quickpod/*` on **quickpod_service_port** (random default if omitted); bind your API only on **worker_api_port**. See `examples/cluster_test_3090.yaml` or `examples/cluster_smoke_e2e.yaml`.
 
 ### `secure_mode: true`
 
-mTLS + HTTPS on the worker. Reconcile injects Caddy, PEMs, and a loopback monitor for `GET /quickpod/logs` (and related paths). Caddy serves **`/quickpod/*` on the same TLS port as `/v1`** (`worker_api_port`) so RunPod only needs one public HTTPS mapping. Your `**run`** should start the app on `**127.0.0.1:18000**` only; do not bind `worker_api_port` yourself. With `replica_log_http: true`, omit `quickpod_service_port` (it is forced equal to `worker_api_port` for validation).
+mTLS + HTTPS on the worker. Reconcile injects Caddy, PEMs, and a loopback monitor for `GET /quickpod/logs` (and related paths). Caddy serves **`/quickpod/*` on the same TLS port as `/v1`** (`worker_api_port`) so RunPod only needs one public HTTPS mapping. Your `**run`** should start the app on `**127.0.0.1:18000**` only; do not bind `worker_api_port` yourself. Omit `quickpod_service_port` in secure mode (it is forced equal to `worker_api_port` for validation).
 
 `resources.mtls`: inline PEMs or `*_file` paths relative to the YAML. Set `verify_server_hostname: false` when workers use public IPs and the cert CN is `localhost`.
 
@@ -242,6 +243,6 @@ See `k8s/deployment.yaml`: build `Dockerfile`, push an image, create the `runpod
 
 - **Provider:** RunPod only in this release.  
 - **No scale-down** of surplus nodes—only launches when alive count is below `num_nodes`.  
-- **Logs:** RunPod does not stream container stdout over the API; with `replica_log_http: true`, `serve` pulls `/quickpod-log` from workers. Set `replica_log_http: false` to skip.  
+- **Logs:** RunPod does not stream container stdout over the API; `serve` pulls replica logs from workers over HTTP(S) (`/quickpod/logs`, etc.).  
 - **UI “Alive / Ready”** uses RunPod `desiredStatus`; **Ready** means `RUNNING`.
 

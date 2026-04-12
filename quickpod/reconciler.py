@@ -7,6 +7,7 @@ import time
 from runpod.error import QueryError
 
 from quickpod.cluster_store import record_pod_launch, upsert_cluster_touch
+from quickpod.local_service_log import ensure_quickpod_service_log_handler
 from quickpod.runpod_client import (
     count_alive_nodes,
     launch_one_node,
@@ -26,6 +27,7 @@ def reconcile_once(
     spec_path: str | None = None,
     database_url: str | None = None,
 ) -> None:
+    ensure_quickpod_service_log_handler()
     try:
         upsert_cluster_touch(spec, spec_path=spec_path, database_url=database_url)
     except Exception:
@@ -78,13 +80,16 @@ def run_loop(
     gpu_type_id = resolve_gpu_type_id_for_spec(spec, api_key=api_key)
     logger.info("Resolved gpuTypeId: %s", gpu_type_id)
     while True:
-        reconcile_once(
-            spec,
-            api_key,
-            gpu_type_id,
-            spec_path=spec_path,
-            database_url=database_url,
-        )
+        try:
+            reconcile_once(
+                spec,
+                api_key,
+                gpu_type_id,
+                spec_path=spec_path,
+                database_url=database_url,
+            )
+        except Exception:
+            logger.exception("reconcile_once failed; will retry after interval")
         time.sleep(spec.reconcile_interval_seconds)
 
 
@@ -100,12 +105,15 @@ def run_loop_until(
     gpu_type_id = resolve_gpu_type_id_for_spec(spec, api_key=api_key)
     logger.info("Resolved gpuTypeId: %s", gpu_type_id)
     while not stop.is_set():
-        reconcile_once(
-            spec,
-            api_key,
-            gpu_type_id,
-            spec_path=spec_path,
-            database_url=database_url,
-        )
+        try:
+            reconcile_once(
+                spec,
+                api_key,
+                gpu_type_id,
+                spec_path=spec_path,
+                database_url=database_url,
+            )
+        except Exception:
+            logger.exception("reconcile_once failed; will retry after interval")
         if stop.wait(spec.reconcile_interval_seconds):
             break

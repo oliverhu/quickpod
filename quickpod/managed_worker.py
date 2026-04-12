@@ -1,9 +1,11 @@
-"""Inject Caddy + managed monitoring when ``replica_log_http`` is true.
+"""Inject Caddy + managed HTTP monitoring on every worker.
 
 - **``secure_mode: true`` (mTLS):** user ``run`` binds the workload on **127.0.0.1:18000**; quickpod
   adds Caddy on ``worker_api_port`` (``/quickpod/*`` → monitor on loopback **18888**, ``/v1`` → workload)
   (``GET /quickpod/logs``, ``GET /quickpod/system``, ``GET /quickpod/status``), using ``resources.mtls`` PEMs.
-- **``secure_mode: false``:** quickpod writes and starts the same monitor on **0.0.0.0:log_port**;
+  The loopback monitor and Caddy start **before** user ``setup`` so ``/quickpod/*`` is reachable during long
+  installs; ``/v1`` may 502 until ``run`` listens on 18000.
+- **``secure_mode: false``:** quickpod writes and starts the monitor on **0.0.0.0:log_port**;
   your ``run`` must bind **only** ``worker_api_port`` (distinct from the log port).
 """
 
@@ -19,6 +21,53 @@ _LOOPBACK_LOG_HTTP_PORT = 18888
 CADDY_VERSION = "2.8.4"
 
 
+def _caddy_download_bootstrap_py() -> str:
+    """Container bootstrap: download official Caddy tarball without ``curl`` (slim images often omit it)."""
+    return r'''import io, os, shutil, sys, tarfile, urllib.error, urllib.request
+ver = os.environ["CADDY_VER"]
+arch = os.environ["CADDY_ARCH"]
+url = (
+    "https://github.com/caddyserver/caddy/releases/download/v"
+    + ver
+    + "/caddy_"
+    + ver
+    + "_linux_"
+    + arch
+    + ".tar.gz"
+)
+try:
+    with urllib.request.urlopen(url, timeout=300) as resp:
+        raw = resp.read()
+except urllib.error.URLError as e:
+    sys.stderr.write("quickpod: failed to download Caddy: %s\n" % (e,))
+    sys.exit(1)
+if len(raw) < 1024:
+    sys.stderr.write("quickpod: Caddy download too small (%d bytes)\n" % (len(raw),))
+    sys.exit(1)
+os.makedirs("/usr/local/bin", exist_ok=True)
+with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+    names = tf.getnames()
+    member = None
+    if "caddy" in names:
+        member = tf.getmember("caddy")
+    else:
+        for m in tf.getmembers():
+            if m.isfile() and (m.name == "caddy" or m.name.endswith("/caddy")):
+                member = m
+                break
+    if member is None:
+        sys.stderr.write("quickpod: no caddy binary in tarball: %r\n" % (names[:20],))
+        sys.exit(1)
+    f = tf.extractfile(member)
+    if f is None:
+        sys.stderr.write("quickpod: cannot read caddy member %r\n" % (member.name,))
+        sys.exit(1)
+    with open("/usr/local/bin/caddy", "wb") as out:
+        shutil.copyfileobj(f, out)
+os.chmod("/usr/local/bin/caddy", 0o755)
+'''
+
+
 def loopback_api_port() -> int:
     return _LOOPBACK_API_PORT
 
@@ -28,10 +77,6 @@ def managed_worker_validate(resources: ResourcesSpec) -> None:
         return
     if resources.worker_api_port is None:
         raise ValueError("secure_mode: true requires worker_api_port")
-    if resources.replica_log_http:
-        lp = replica_log_http_port(resources)
-        if lp is None:
-            raise ValueError("replica_log_http enabled but no worker_api_port / ports")
 
 
 def _tls_site_directive(cert_path: str, key_path: str) -> str:
@@ -51,9 +96,8 @@ def _tls_site_directive(cert_path: str, key_path: str) -> str:
 def _caddyfile_body(resources: ResourcesSpec) -> str:
     """mTLS PEMs from spec; ``auto_https off`` avoids ACME.
 
-    With ``replica_log_http``, ``/quickpod/*`` is served on the **same** TLS site as the API
-    (``worker_api_port`` only) so RunPod maps a single public HTTPS port — a second listener
-    often fails or is unreachable from the control plane.
+    ``/quickpod/*`` is served on the **same** TLS site as the API (``worker_api_port`` only) so RunPod maps
+    a single public HTTPS port — a second listener often fails or is unreachable from the control plane.
     """
     assert resources.worker_api_port is not None
     api_pub = resources.worker_api_port
@@ -67,26 +111,14 @@ def _caddyfile_body(resources: ResourcesSpec) -> str:
         "}",
         f":{api_pub} {{",
         _tls_site_directive(api_cert, api_key),
+        "  handle /quickpod/* {",
+        f"    reverse_proxy 127.0.0.1:{_LOOPBACK_LOG_HTTP_PORT}",
+        "  }",
+        "  handle {",
+        f"    reverse_proxy 127.0.0.1:{_LOOPBACK_API_PORT}",
+        "  }",
+        "}",
     ]
-    if resources.replica_log_http:
-        parts.extend(
-            [
-                "  handle /quickpod/* {",
-                f"    reverse_proxy 127.0.0.1:{_LOOPBACK_LOG_HTTP_PORT}",
-                "  }",
-                "  handle {",
-                f"    reverse_proxy 127.0.0.1:{_LOOPBACK_API_PORT}",
-                "  }",
-                "}",
-            ]
-        )
-    else:
-        parts.extend(
-            [
-                f"  reverse_proxy 127.0.0.1:{_LOOPBACK_API_PORT}",
-                "}",
-            ]
-        )
     return "\n".join(parts) + "\n"
 
 
@@ -440,18 +472,20 @@ def plain_monitor_embed_shell(spec: ClusterSpec) -> str:
 
 
 def managed_setup_block(resources: ResourcesSpec, health: HealthCheckSpec | None) -> str:
-    """Shell after user ``setup``: Caddy, Caddyfile, optional log HTTP script."""
+    """Shell: install Caddy, write Caddyfile, write monitor script (does not start listeners)."""
     lines = [
         'ARCH=$(uname -m)',
         'case "$ARCH" in',
-        "  x86_64) CADDY_ARCH=amd64 ;;",
-        "  aarch64|arm64) CADDY_ARCH=arm64 ;;",
+        "  x86_64) export CADDY_ARCH=amd64 ;;",
+        "  aarch64|arm64) export CADDY_ARCH=arm64 ;;",
         '  *) echo "unsupported arch: $ARCH"; exit 1 ;;',
         "esac",
         f"CADDY_VER={CADDY_VERSION}",
-        'curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/caddy_${CADDY_VER}_linux_${CADDY_ARCH}.tar.gz" \\',
-        "  | tar xz -C /usr/local/bin caddy",
-        "chmod +x /usr/local/bin/caddy",
+        "export CADDY_VER",
+        "cat > /workspace/quickpod-fetch-caddy.py <<'QPCADDYDL'",
+        _caddy_download_bootstrap_py().rstrip("\n"),
+        "QPCADDYDL",
+        "python3 /workspace/quickpod-fetch-caddy.py",
     ]
     lines.extend(_mtls_embed_lines(resources))
 
@@ -467,53 +501,65 @@ def managed_setup_block(resources: ResourcesSpec, health: HealthCheckSpec | None
         ]
     )
 
-    if resources.replica_log_http:
-        log_file = (resources.managed_log_file or "/workspace/replica.log").strip()
-        py = _monitor_http_py_body(log_file, _LOOPBACK_LOG_HTTP_PORT, "127.0.0.1", health)
-        lines.append("cat > /workspace/quickpod_monitor_http.py <<'QPLOGEOF'")
-        lines.append(py.rstrip("\n"))
-        lines.append("QPLOGEOF")
+    log_file = (resources.managed_log_file or "/workspace/replica.log").strip()
+    py = _monitor_http_py_body(log_file, _LOOPBACK_LOG_HTTP_PORT, "127.0.0.1", health)
+    lines.append("cat > /workspace/quickpod_monitor_http.py <<'QPLOGEOF'")
+    lines.append(py.rstrip("\n"))
+    lines.append("QPLOGEOF")
 
     return "\n".join(lines)
 
 
-def managed_run_block(resources: ResourcesSpec, user_run: str) -> str:
+def managed_edgeservices_background(resources: ResourcesSpec) -> str:
+    """Start loopback monitor + Caddy in the background; sets ``CADDY_PID`` for ``wait``."""
+    assert resources.worker_api_port is not None
+    return "\n".join(
+        [
+            "export XDG_DATA_HOME=/workspace/.caddy-data",
+            'mkdir -p "$XDG_DATA_HOME"',
+            "python3 -u /workspace/quickpod_monitor_http.py &",
+            "/usr/local/bin/caddy run --config /workspace/Caddyfile --adapter caddyfile &",
+            "CADDY_PID=$!",
+        ]
+    )
+
+
+def managed_user_run_wait_caddy(user_run: str) -> str:
+    """Run user workload in background; block on Caddy (started earlier)."""
     ur = user_run.strip()
     if not ur:
         raise ValueError(
             "secure_mode requires a non-empty run: script "
             f"(workload must listen on 127.0.0.1:{_LOOPBACK_API_PORT})"
         )
-    lines = [
-        "export XDG_DATA_HOME=/workspace/.caddy-data",
-        'mkdir -p "$XDG_DATA_HOME"',
-    ]
-    if resources.replica_log_http:
-        lines.append("python3 -u /workspace/quickpod_monitor_http.py &")
-    lines.extend(["(", ur, ") &", "exec caddy run --config /workspace/Caddyfile --adapter caddyfile"])
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            "(",
+            ur,
+            ") &",
+            'wait "${CADDY_PID:?quickpod: CADDY_PID unset (caddy did not start)}"',
+        ]
+    )
 
 
 def build_container_startup_script(spec: ClusterSpec) -> str:
     """Full bash script embedded as ORCH_B64."""
     header_plain = "#!/usr/bin/env bash\nset -euo pipefail\n"
     if not spec.resources.secure_mode:
-        if spec.resources.replica_log_http:
-            return (
-                header_plain
-                + "mkdir -p /workspace\n"
-                + _shell_write_lifecycle("setup")
-                + "\n"
-                + plain_monitor_embed_shell(spec)
-                + "\n"
-                + spec.setup.strip()
-                + "\n"
-                + _shell_write_lifecycle("running")
-                + "\n"
-                + spec.run.strip()
-                + "\n"
-            )
-        return header_plain + spec.setup.strip() + "\n" + spec.run.strip() + "\n"
+        return (
+            header_plain
+            + "mkdir -p /workspace\n"
+            + _shell_write_lifecycle("setup")
+            + "\n"
+            + plain_monitor_embed_shell(spec)
+            + "\n"
+            + spec.setup.strip()
+            + "\n"
+            + _shell_write_lifecycle("running")
+            + "\n"
+            + spec.run.strip()
+            + "\n"
+        )
 
     managed_worker_validate(spec.resources)
     log_file = (spec.resources.managed_log_file or "/workspace/replica.log").strip()
@@ -527,12 +573,14 @@ def build_container_startup_script(spec: ClusterSpec) -> str:
         header
         + _shell_write_lifecycle("setup")
         + "\n"
+        + managed_setup_block(spec.resources, spec.health)
+        + "\n"
+        + managed_edgeservices_background(spec.resources)
+        + "\n"
         + spec.setup.strip()
         + "\n"
         + _shell_write_lifecycle("running")
         + "\n"
-        + managed_setup_block(spec.resources, spec.health)
-        + "\n"
-        + managed_run_block(spec.resources, spec.run)
+        + managed_user_run_wait_caddy(spec.run)
         + "\n"
     )

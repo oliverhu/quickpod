@@ -20,11 +20,6 @@ def main() -> None:
 
     host = os.environ.get("QUICKPOD_SERVE_HOST", "0.0.0.0")
     port = int(os.environ.get("QUICKPOD_SERVE_PORT", "8765"))
-    reconcile = os.environ.get("QUICKPOD_SERVE_RECONCILE", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
     database_url = os.environ.get("QUICKPOD_DATABASE_URL") or None
     ssl_cert = os.environ.get("QUICKPOD_SERVE_SSL_CERTFILE") or None
     ssl_key = os.environ.get("QUICKPOD_SERVE_SSL_KEYFILE") or None
@@ -42,7 +37,6 @@ def main() -> None:
         key,
         host=host,
         port=port,
-        reconcile=reconcile,
         spec_path=spec_path,
         database_url=database_url,
         ssl_certfile=ssl_cert,

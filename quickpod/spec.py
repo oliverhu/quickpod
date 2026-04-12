@@ -80,21 +80,12 @@ class ResourcesSpec(BaseModel):
         ge=1,
         description="Minimum vCPUs for CPU pods (defaults to 2 when compute_type is CPU)",
     )
-    replica_log_http: bool = Field(
-        default=True,
-        description=(
-            "If True, quickpod serve pulls replica monitoring from quickpod_service_port and quickpod "
-            "injects the monitor in the container startup script (secure_mode or not): "
-            "GET /quickpod/logs (plain text), GET /quickpod/system (JSON), GET /quickpod/status "
-            "(lifecycle + optional health). Set False to skip injection and dashboard fetches."
-        ),
-    )
     ports: list[int] = Field(
         default_factory=lambda: [8000],
         description=(
             "Container ports exposed by RunPod; must include worker_api_port. "
-            "When replica_log_http is true and quickpod_service_port is omitted, a random port is "
-            "chosen and merged into this list."
+            "When quickpod_service_port is omitted (plain HTTP), a random port is chosen and merged "
+            "into this list."
         ),
     )
     quickpod_service_port: int | None = Field(
@@ -119,7 +110,8 @@ class ResourcesSpec(BaseModel):
         description=(
             "If true: quickpod injects Caddy + mTLS on workers; use https:// with client certs. "
             "Requires resources.mtls PEM fields (or *_file paths ingested at load_spec). "
-            "If false: plain HTTP to workers; you own the full container script (no injection)."
+            "If false: plain HTTP to workers; quickpod injects /quickpod/* on quickpod_service_port "
+            "and you bind the workload only on worker_api_port."
         ),
     )
     managed_log_file: str | None = Field(
@@ -166,6 +158,10 @@ class ResourcesSpec(BaseModel):
             return data
         if "log_server_port" in data and "quickpod_service_port" not in data:
             data = {**data, "quickpod_service_port": data.pop("log_server_port")}
+        if "replica_log_http" in data:
+            raise ValueError(
+                "resources.replica_log_http was removed: replica HTTP monitoring is always enabled."
+            )
         legacy = ("worker_https", "worker_tls_verify", "managed_worker_tls")
         bad = [k for k in legacy if k in data]
         if bad:
@@ -193,25 +189,26 @@ class ResourcesSpec(BaseModel):
                 s = s.model_copy(update={"min_vcpu_count": 2})
         elif s.gpu_count < 1:
             raise ValueError("For compute_type GPU, gpu_count must be >= 1")
-        if s.replica_log_http:
-            wp = s.worker_api_port
-            ports_list = list(s.ports)
-            if s.secure_mode and wp is not None:
-                qp = wp
-                ports_final = sorted({wp} | set(ports_list))
-                s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
-            else:
-                qp = s.quickpod_service_port
-                if qp is None:
-                    qp = _allocate_quickpod_service_port(
-                        wp, ports_list, seed=s.quickpod_allocation_seed
-                    )
-                if wp is not None and qp == wp:
-                    raise ValueError(
-                        "replica_log_http requires distinct quickpod_service_port and worker_api_port"
-                    )
-                ports_final = sorted(set(ports_list) | {qp})
-                s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
+        wp = s.worker_api_port
+        ports_list = list(s.ports)
+        if s.secure_mode and wp is not None:
+            qp = wp
+            ports_final = sorted({wp} | set(ports_list))
+            s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
+        else:
+            qp = s.quickpod_service_port
+            if qp is None:
+                qp = _allocate_quickpod_service_port(
+                    wp, ports_list, seed=s.quickpod_allocation_seed
+                )
+            if wp is not None and qp == wp:
+                raise ValueError(
+                    "quickpod_service_port cannot equal worker_api_port for plain HTTP: "
+                    "quickpod serves /quickpod/* on quickpod_service_port; bind the workload "
+                    "only on worker_api_port."
+                )
+            ports_final = sorted(set(ports_list) | {qp})
+            s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
         if s.worker_api_port is not None and s.worker_api_port not in s.ports:
             raise ValueError(
                 f"worker_api_port {s.worker_api_port} must be in resources.ports"
@@ -245,16 +242,14 @@ class ResourcesSpec(BaseModel):
                 raise ValueError(
                     "resources.mtls is only used when secure_mode: true (or remove mtls fields)"
                 )
-            if s.replica_log_http:
-                lp = replica_log_http_port(s)
-                wp = s.worker_api_port
-                if lp is not None and wp is not None and lp == wp:
-                    raise ValueError(
-                        "replica_log_http with secure_mode false requires distinct quickpod and API "
-                        "ports: quickpod injects /quickpod/logs and /quickpod/system on "
-                        "quickpod_service_port; bind your workload only on worker_api_port (see "
-                        "resources.ports, quickpod_service_port, worker_api_port)."
-                    )
+            lp = replica_log_http_port(s)
+            wp = s.worker_api_port
+            if lp == wp:
+                raise ValueError(
+                    "Plain HTTP requires distinct quickpod_service_port and worker_api_port: "
+                    "quickpod injects /quickpod/logs and /quickpod/system on quickpod_service_port; "
+                    "bind your workload only on worker_api_port (see resources.ports)."
+                )
         return s
 
 
@@ -303,14 +298,12 @@ class HealthCheckSpec(BaseModel):
         return s
 
 
-def replica_log_http_port(resources: ResourcesSpec) -> int | None:
+def replica_log_http_port(resources: ResourcesSpec) -> int:
     """Port quickpod uses to reach GET /quickpod/logs, /quickpod/system, /quickpod/status on replicas.
 
     For ``secure_mode: true``, this is ``worker_api_port`` (same mTLS site as ``/v1``; Caddy routes by path).
     For plain HTTP, it is ``quickpod_service_port`` (separate listener).
     """
-    if not resources.replica_log_http:
-        return None
     if resources.secure_mode and resources.worker_api_port is not None:
         return resources.worker_api_port
     qp = resources.quickpod_service_port
@@ -335,7 +328,7 @@ class ClusterSpec(BaseModel):
         if not isinstance(name, str) or not isinstance(res, dict):
             return data
         res = dict(res)
-        if res.get("quickpod_service_port") is None and res.get("replica_log_http", True) is not False:
+        if res.get("quickpod_service_port") is None:
             res["quickpod_allocation_seed"] = name
         out = dict(data)
         out["resources"] = res
@@ -348,7 +341,7 @@ class ClusterSpec(BaseModel):
     run: str = ""
     health: HealthCheckSpec | None = Field(
         default=None,
-        description="Optional health probe (see HealthCheckSpec); requires replica_log_http.",
+        description="Optional health probe (see HealthCheckSpec); served via /quickpod/status on replicas.",
     )
 
     @field_validator("envs")
@@ -370,15 +363,6 @@ class ClusterSpec(BaseModel):
         if not s:
             return ""
         return textwrap.dedent(s).strip()
-
-    @model_validator(mode="after")
-    def health_requires_replica_monitor(self) -> ClusterSpec:
-        if self.health is not None and not self.resources.replica_log_http:
-            raise ValueError(
-                "health: requires resources.replica_log_http: true (embedded monitor serves /quickpod/status)"
-            )
-        return self
-
 
 def _ingest_mtls_pem_files(raw: dict, spec_path: Path) -> None:
     res = raw.get("resources")

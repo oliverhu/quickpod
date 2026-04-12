@@ -3,7 +3,7 @@
 
 By default terminates the cluster at the end (RunPod + local store).
 
-With --keep-pods: calls `quickpod.serve_runner.run_serve(..., reconcile=True)` while you use the UI;
+With --keep-pods: calls `quickpod.serve_runner.run_serve` (dashboard + background reconcile loop) while you use the UI;
 when you stop the server (Ctrl+C or any exit from uvicorn), the script terminates RunPod pods and
 removes the cluster from the local store (same as `quickpod clusters remove <name> --yes`).
 
@@ -15,6 +15,12 @@ removes the cluster from the local store (same as `quickpod clusters remove <nam
 HTTPS + mTLS to workers — use:
   uv run python scripts/smoke_e2e_proxy.py --spec examples/cluster_smoke_e2e_mtls.yaml
 
+Optional: prove a terminated replica is replaced (needs ``--nodes >= 2`` and matches
+``quickpod serve`` / ``quickpod reconcile`` loop behavior):
+
+  uv run python scripts/smoke_e2e_proxy.py --spec examples/cluster_smoke_e2e_mtls.yaml \\
+    --clean-start --worker-wait-sec 1800 --nodes 2 --verify-replace-after-terminate
+
 Requires RUNPOD_API_KEY (environment or `.env`; see README).
 
 Worker readiness wait defaults to 60 seconds; use ``--worker-wait-sec`` for slow starts (e.g. vLLM + large models).
@@ -23,24 +29,28 @@ Worker readiness wait defaults to 60 seconds; use ``--worker-wait-sec`` for slow
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 import httpx
+import runpod
 import yaml
 from starlette.testclient import TestClient
 
 from quickpod.cluster_store import delete_cluster_record, resolve_database_url
 from quickpod.runtime_env import require_runpod_api_key
-from quickpod.reconciler import reconcile_once
+from quickpod.reconciler import reconcile_once, run_loop_until
 from quickpod.serve_runner import run_serve
 from quickpod.runpod_client import (
     configure_api,
+    count_alive_nodes,
     count_ready_nodes,
     list_managed_pods,
     public_http_endpoint,
@@ -53,6 +63,8 @@ from quickpod.web_app import build_app
 from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
 
 DEFAULT_WORKER_WAIT_SEC = 60
+# Fail fast if RunPod still lists zero pods for this cluster (name/API/reconcile issue).
+MANAGED_ZERO_HARD_TIMEOUT_SEC = 60
 
 
 def tcp_check(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -195,16 +207,29 @@ def wait_workers_ready(
 ) -> list[dict]:
     scheme = "https" if use_https else "http"
     deadline = time.monotonic() + max_wait_sec
+    managed_zero_deadline: float | None = None
     while time.monotonic() < deadline:
         pods = list_managed_pods(cluster, api_key=api_key)
         running = [p for p in pods if (p.get("desiredStatus") or "").upper() == "RUNNING"]
         if len(running) < desired:
+            if len(pods) == 0:
+                if managed_zero_deadline is None:
+                    managed_zero_deadline = time.monotonic() + MANAGED_ZERO_HARD_TIMEOUT_SEC
+                elif time.monotonic() >= managed_zero_deadline:
+                    raise TimeoutError(
+                        f"no RunPod pods matched cluster {cluster!r} for "
+                        f"{MANAGED_ZERO_HARD_TIMEOUT_SEC}s (managed=0 while waiting for "
+                        f"RUNNING {desired}) — check cluster name, RUNPOD_API_KEY, or reconcile"
+                    )
+            else:
+                managed_zero_deadline = None
             print(
                 f"  … RUNNING {len(running)}/{desired} (managed={len(pods)})",
                 flush=True,
             )
             time.sleep(poll_sec)
             continue
+        managed_zero_deadline = None
         ok: list[dict] = []
         for p in running:
             log_ep = public_http_endpoint(p, log_port)
@@ -270,6 +295,22 @@ def prepare_spec_path(base: Path, num_nodes: int) -> tuple[str, bool]:
     if int(raw.get("num_nodes", 0)) == num_nodes:
         return str(base.resolve()), False
     raw["num_nodes"] = num_nodes
+    # Temp file lives under /tmp; mTLS *_file paths must stay relative to the original spec dir.
+    spec_dir = base.resolve().parent
+    res = raw.get("resources")
+    if isinstance(res, dict):
+        mt = res.get("mtls")
+        if isinstance(mt, dict):
+            for fk in (
+                "ca_file",
+                "client_cert_file",
+                "client_key_file",
+                "server_cert_file",
+                "server_key_file",
+            ):
+                v = mt.get(fk)
+                if v and not Path(str(v)).is_absolute():
+                    mt[fk] = str((spec_dir / str(v)).resolve())
     fd, tmp = tempfile.mkstemp(suffix=".yaml", prefix="quickpod-smoke-")
     os.close(fd)
     p = Path(tmp)
@@ -313,7 +354,7 @@ def main() -> int:
     ap.add_argument(
         "--keep-pods",
         action="store_true",
-        help="After checks, run serve+reconcile until stopped; on exit (e.g. Ctrl+C) terminate pods and DB row",
+        help="After checks, run `quickpod serve` (proxy + background reconcile) until stopped; on exit terminate pods and DB row",
     )
     ap.add_argument(
         "--serve-host",
@@ -339,12 +380,28 @@ def main() -> int:
         metavar="SEC",
         help=(
             "Max seconds to wait for each worker to pass /quickpod/logs, /quickpod/system, and "
-            "/v1/models (default 60; use 1800–7200 for vLLM first boot + HF download)"
+            "/v1/models (default 60; use 1800–7200 for vLLM first boot + HF download). "
+            "Also used as max wait for --verify-replace-after-terminate."
+        ),
+    )
+    ap.add_argument(
+        "--verify-replace-after-terminate",
+        action="store_true",
+        help=(
+            "After smoke checks: start the same background reconcile loop as `quickpod serve`, "
+            "terminate one RunPod via API, then wait until num_nodes workers are ready again "
+            "(requires --nodes >= 2). The default smoke run does NOT do this."
         ),
     )
     args = ap.parse_args()
     if args.nodes < 1:
         print("--nodes must be >= 1", file=sys.stderr)
+        return 2
+    if args.verify_replace_after_terminate and args.nodes < 2:
+        print(
+            "--verify-replace-after-terminate requires --nodes >= 2",
+            file=sys.stderr,
+        )
         return 2
 
     key = require_runpod_api_key()
@@ -358,9 +415,6 @@ def main() -> int:
     try:
         cluster = spec.name
         log_port = replica_log_http_port(spec.resources)
-        if log_port is None:
-            print("Spec must enable replica_log_http with a log port.", file=sys.stderr)
-            return 2
         api_port = spec.resources.worker_api_port
         if api_port is None:
             print("Spec must set resources.worker_api_port.", file=sys.stderr)
@@ -429,6 +483,15 @@ def main() -> int:
                 )
                 return 1
 
+            local_log = str(snap.get("local_service_log") or "")
+            if "quickpod" not in local_log.lower():
+                print(
+                    "FAIL /api/cluster local_service_log missing quickpod reconcile logs "
+                    f"(len={len(local_log)!r} preview={local_log[:400]!r})",
+                    file=sys.stderr,
+                )
+                return 1
+
             pr = client.get("/v1/models")
             if pr.status_code != 200:
                 print(
@@ -483,11 +546,79 @@ def main() -> int:
                     return 1
                 print(f"    distinct upstream worker ids: {seen}", flush=True)
 
+        if args.verify_replace_after_terminate:
+            print(
+                "== 5) verify replacement: reconcile loop + terminate one pod → back to "
+                f"{args.nodes} ready",
+                flush=True,
+            )
+            stop_rc = threading.Event()
+            rc_thread = threading.Thread(
+                target=functools.partial(
+                    run_loop_until,
+                    spec,
+                    key,
+                    stop_rc,
+                    spec_path=spec_path_abs,
+                    database_url=db_url,
+                ),
+                name="quickpod-smoke-reconcile",
+                daemon=True,
+            )
+            rc_thread.start()
+            time.sleep(min(max(2.0, float(spec.reconcile_interval_seconds) * 0.5), 8.0))
+
+            pods_pre = list_managed_pods(cluster, api_key=key)
+            running = [
+                p
+                for p in pods_pre
+                if (p.get("desiredStatus") or "").upper() == "RUNNING" and p.get("id")
+            ]
+            if len(running) < 1:
+                print("FAIL: no RUNNING pod to terminate", file=sys.stderr)
+                stop_rc.set()
+                rc_thread.join(timeout=20.0)
+                cleanup_cluster(cluster, key, db_url)
+                return 1
+            victim = running[0]
+            vid = str(victim["id"])
+            print(f"    terminating pod id={vid} (expect reconcile to launch a replacement)", flush=True)
+            runpod.terminate_pod(vid)
+
+            try:
+                wait_workers_ready(
+                    cluster,
+                    key,
+                    args.nodes,
+                    log_port,
+                    api_port,
+                    use_https=use_https,
+                    spec=spec,
+                    max_wait_sec=args.worker_wait_sec,
+                )
+            except TimeoutError as e:
+                print(f"FAIL (replacement): {e}", file=sys.stderr)
+                alive = count_alive_nodes(list_managed_pods(cluster, api_key=key))
+                ready = count_ready_nodes(list_managed_pods(cluster, api_key=key))
+                print(
+                    f"    last observed alive={alive} ready={ready} (want {args.nodes})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                stop_rc.set()
+                rc_thread.join(timeout=20.0)
+                cleanup_cluster(cluster, key, db_url)
+                return 1
+
+            stop_rc.set()
+            rc_thread.join(timeout=20.0)
+            print("    replacement workers ready — reconcile loop behaved as expected", flush=True)
+
         print("== OK: smoke E2E passed", flush=True)
         if args.keep_pods:
             print(
-                "== serve: quickpod.serve_runner.run_serve(reconcile=True) — same as "
-                "`quickpod serve --reconcile`",
+                "== serve: quickpod.serve_runner.run_serve — same as `quickpod serve` "
+                "(dashboard + background reconcile)",
                 flush=True,
             )
             print(
@@ -520,7 +651,6 @@ def main() -> int:
                     key,
                     host=args.serve_host,
                     port=args.serve_port,
-                    reconcile=True,
                     spec_path=spec_path_abs,
                     database_url=db_url,
                 )
@@ -529,7 +659,10 @@ def main() -> int:
                 cleanup_cluster(cluster, key, db_url)
             return 0
 
-        print("== 5) terminate cluster", flush=True)
+        print(
+            f"== {6 if args.verify_replace_after_terminate else 5}) terminate cluster",
+            flush=True,
+        )
         cleanup_cluster(cluster, key, db_url)
         return 0
     finally:

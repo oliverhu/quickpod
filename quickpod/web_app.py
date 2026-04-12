@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any
+
+_log = logging.getLogger(__name__)
+_SNAPSHOT_LOG_INTERVAL_SEC = 18.0
+_snapshot_last_logged: dict[str, float] = {}
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +20,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from starlette.background import BackgroundTask
 from starlette.responses import Response
 
+from quickpod.local_service_log import (
+    ensure_quickpod_service_log_handler,
+    get_quickpod_service_log_text,
+)
 from quickpod.runpod_client import (
     count_alive_nodes,
     count_ready_nodes,
@@ -43,6 +53,8 @@ _HOP_BY_HOP = frozenset(
 # Dashboard shows the tail of each log: entries append over time; the head is usually apt/setup.
 _LOG_PREVIEW_FETCH_MAX = 12000
 _LOG_PREVIEW_UI_MAX = 4000
+_LOCAL_SVC_LOG_SNAPSHOT_MAX = 48000
+_LOCAL_SVC_LOG_UI_MAX = 8000
 
 
 def _tail_for_preview(text: str, max_chars: int) -> str:
@@ -154,6 +166,18 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     .pill span {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
     .grid {{ display: grid; gap: 1rem; }}
     @media (min-width: 720px) {{ .grid {{ grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }} }}
+    .section-title {{
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin: 1.75rem 0 0.35rem;
+    }}
+    .section-note {{
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin: 0 0 0.75rem;
+      line-height: 1.4;
+    }}
+    .local-svc-wrap article pre {{ max-height: 360px; }}
     article {{
       background: var(--card);
       border: 1px solid var(--border);
@@ -210,6 +234,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
   <div class="grid" id="replica-grid">
     {replica_cards}
+  </div>
+  <h2 class="section-title">Local quickpod service</h2>
+  <p class="section-note">Logs from this process (e.g. reconcile loop, RunPod client). Not GPU worker container logs.</p>
+  <div class="local-svc-wrap">
+    <article>
+      <pre id="local-svc-pre">{local_service_log}</pre>
+    </article>
   </div>
   <footer>quickpod · <code>/api/cluster</code> · replica monitor: {log_footer} · workers reached over HTTPS by this service only</footer>
   <script>
@@ -280,12 +311,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     return esc('—');
   }}
 
-  function scrollReplicaLogsToBottom() {{
+  function scrollLogPresToBottom() {{
     const grid = document.getElementById('replica-grid');
-    if (!grid) return;
-    grid.querySelectorAll('pre').forEach(function (el) {{
-      el.scrollTop = el.scrollHeight;
-    }});
+    if (grid) {{
+      grid.querySelectorAll('pre').forEach(function (el) {{
+        el.scrollTop = el.scrollHeight;
+      }});
+    }}
+    const loc = document.getElementById('local-svc-pre');
+    if (loc) loc.scrollTop = loc.scrollHeight;
   }}
 
   function render(data) {{
@@ -298,6 +332,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     if (!reps.length) {{
       grid.innerHTML = '<p>No matching pods yet.</p>';
       return;
+    }}
+    const locPre = document.getElementById('local-svc-pre');
+    if (locPre) {{
+      locPre.textContent = tailPreview(data.local_service_log || '', 8000);
     }}
     grid.innerHTML = reps.map(function (r) {{
       const stCls = (r.status || '').toUpperCase() === 'RUNNING' ? 'st-running' : 'st-warn';
@@ -315,8 +353,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         '</article>'
       );
     }}).join('');
-    scrollReplicaLogsToBottom();
-    requestAnimationFrame(scrollReplicaLogsToBottom);
+    scrollLogPresToBottom();
+    requestAnimationFrame(scrollLogPresToBottom);
   }}
 
   async function refresh() {{
@@ -332,7 +370,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   }}
 
   document.addEventListener('DOMContentLoaded', function () {{
-    scrollReplicaLogsToBottom();
+    scrollLogPresToBottom();
     refresh();
     setInterval(refresh, 5000);
   }});
@@ -349,13 +387,12 @@ def build_app(
     *,
     public_path_prefix: str = "",
 ) -> FastAPI:
+    ensure_quickpod_service_log_handler()
     http_port = replica_log_http_port(spec.resources)
     log_footer = (
         f"port {http_port} → <code>/quickpod/logs</code>, <code>/quickpod/system</code>, "
         f"<code>/quickpod/status</code> "
         f"(via quickpod → worker {'HTTPS+mTLS' if spec.resources.secure_mode else 'HTTP'})"
-        if http_port is not None
-        else "disabled (<code>replica_log_http: false</code>)"
     )
 
     def _init_proxy_state(a: FastAPI) -> None:
@@ -369,6 +406,7 @@ def build_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Runs for standalone `quickpod serve`; **not** for apps mounted under `quickpod ui`.
+        ensure_quickpod_service_log_handler()
         _init_proxy_state(app)
         yield
         await app.state.http.aclose()
@@ -378,6 +416,8 @@ def build_app(
 
     @app.middleware("http")
     async def ensure_proxy_state(request: Request, call_next):
+        # Uvicorn may disable existing loggers; mounted hub sub-apps skip lifespan — re-attach here.
+        ensure_quickpod_service_log_handler()
         # Mounted sub-apps do not receive lifespan events; lazily init httpx + worker ring.
         if getattr(request.app.state, "http", None) is None:
             async with _proxy_lock:
@@ -398,6 +438,19 @@ def build_app(
         alive = count_alive_nodes(pods)
         ready = count_ready_nodes(pods)
         bases = worker_base_urls(spec, api_key, require_running=True)
+        now = time.time()
+        prev = _snapshot_last_logged.get(spec.name, 0.0)
+        if now - prev >= _SNAPSHOT_LOG_INTERVAL_SEC:
+            _snapshot_last_logged[spec.name] = now
+            _log.info(
+                "dashboard snapshot: cluster=%s alive=%s ready=%s shortage_ready=%s "
+                "worker_backends=%s",
+                spec.name,
+                alive,
+                ready,
+                max(0, spec.num_nodes - ready),
+                len(bases),
+            )
         return {
             "cluster": spec.name,
             "desired": spec.num_nodes,
@@ -406,11 +459,14 @@ def build_app(
             "shortage_alive": max(0, spec.num_nodes - alive),
             "shortage_ready": max(0, spec.num_nodes - ready),
             "replicas": [_replica_view(spec, p, http_port, api_key=api_key) for p in pods],
-            "replica_log_http": http_port is not None,
+            "replica_log_http": True,
             "replica_log_port": http_port,
             "openai_proxy_path": "/v1",
             "worker_backends_ready": len(bases),
             "secure_mode": spec.resources.secure_mode,
+            "local_service_log": get_quickpod_service_log_text(
+                max_chars=_LOCAL_SVC_LOG_SNAPSHOT_MAX
+            ),
         }
 
     async def _proxy_v1(request: Request, path_fragment: str) -> Response:
@@ -494,15 +550,17 @@ def build_app(
     def api_cluster() -> JSONResponse:
         return JSONResponse(_snapshot())
 
+    @app.get("/api/local-service-log", response_class=PlainTextResponse)
+    def api_local_service_log() -> PlainTextResponse:
+        return PlainTextResponse(
+            get_quickpod_service_log_text(max_chars=_LOCAL_SVC_LOG_SNAPSHOT_MAX)
+        )
+
     @app.get("/api/replicas/{pod_id}/log")
     def api_replica_log(pod_id: str) -> PlainTextResponse:
         pods = list_managed_pods(spec.name, api_key=api_key)
         for p in pods:
             if str(p.get("id")) == pod_id:
-                if http_port is None:
-                    return PlainTextResponse(
-                        "replica log HTTP disabled in spec (resources.replica_log_http: false)\n"
-                    )
                 text = fetch_replica_http_log(
                     p,
                     http_port,
@@ -520,10 +578,6 @@ def build_app(
         pods = list_managed_pods(spec.name, api_key=api_key)
         for p in pods:
             if str(p.get("id")) == pod_id:
-                if http_port is None:
-                    return JSONResponse(
-                        {"error": "replica monitor disabled in spec (resources.replica_log_http: false)"}
-                    )
                 data = fetch_replica_system_snapshot(
                     p,
                     http_port,
@@ -541,10 +595,6 @@ def build_app(
         pods = list_managed_pods(spec.name, api_key=api_key)
         for p in pods:
             if str(p.get("id")) == pod_id:
-                if http_port is None:
-                    return JSONResponse(
-                        {"error": "replica monitor disabled in spec (resources.replica_log_http: false)"}
-                    )
                 data = fetch_replica_status_snapshot(
                     p,
                     http_port,
@@ -583,6 +633,12 @@ def build_app(
   <pre>{log_preview}</pre>
 </article>"""
             )
+        local_log = html.escape(
+            _tail_for_preview(
+                snap.get("local_service_log") or "",
+                _LOCAL_SVC_LOG_UI_MAX,
+            )
+        )
         return _DASHBOARD_HTML.format(
             cluster_name=html.escape(spec.name),
             num_nodes=spec.num_nodes,
@@ -590,6 +646,7 @@ def build_app(
             alive=snap["alive"],
             managed=len(snap["replicas"]),
             replica_cards="\n".join(cards) if cards else "<p>No matching pods yet.</p>",
+            local_service_log=local_log,
             log_footer=log_footer,
             api_prefix=html.escape(public_path_prefix or "", quote=True),
         )
@@ -600,7 +657,7 @@ def build_app(
 def _replica_view(
     spec: ClusterSpec,
     pod: dict[str, Any],
-    http_port: int | None,
+    http_port: int,
     *,
     api_key: str,
     log_max: int = _LOG_PREVIEW_FETCH_MAX,
@@ -608,19 +665,6 @@ def _replica_view(
     pid = str(pod.get("id") or "")
     name = str(pod.get("name") or "")
     st = str(pod.get("desiredStatus") or "")
-    if http_port is None:
-        return {
-            "id": pid,
-            "name": name,
-            "status": st,
-            "endpoint": None,
-            "endpoint_note": "logs disabled in spec",
-            "log_preview": (
-                "(replica log fetch disabled in spec — set resources.replica_log_http: true)\n"
-            ),
-            "system": {"error": "replica monitor disabled in spec"},
-            "quickpod_status": {"error": "replica monitor disabled in spec"},
-        }
     use_https = spec.resources.secure_mode
     tls_insecure = False
     preview = fetch_replica_http_log(

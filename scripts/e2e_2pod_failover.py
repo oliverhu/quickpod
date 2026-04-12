@@ -99,12 +99,6 @@ def main() -> None:
     spec = load_spec(spec_path)
     cluster = spec.name
     private_port = replica_log_http_port(spec.resources)
-    if private_port is None:
-        print(
-            "This script requires resources.replica_log_http: true and a log port in spec.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
 
     print("== 1) Initial reconcile (launch up to num_nodes)", flush=True)
     gpu_type_id = resolve_gpu_type_id_for_spec(spec, api_key=key)

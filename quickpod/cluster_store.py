@@ -289,7 +289,6 @@ def upsert_serve_launch_prefs(
     spec_path: str,
     host: str,
     port: int,
-    reconcile: bool = False,
     ssl_certfile: str | None = None,
     ssl_keyfile: str | None = None,
     database_url: str | None = None,
@@ -305,7 +304,7 @@ def upsert_serve_launch_prefs(
                     spec_path=spec_path,
                     host=host,
                     port=port,
-                    reconcile=reconcile,
+                    reconcile=True,
                     ssl_certfile=ssl_certfile,
                     ssl_keyfile=ssl_keyfile,
                 )
@@ -314,7 +313,7 @@ def upsert_serve_launch_prefs(
             row.spec_path = spec_path
             row.host = host
             row.port = port
-            row.reconcile = reconcile
+            row.reconcile = True
             row.ssl_certfile = ssl_certfile
             row.ssl_keyfile = ssl_keyfile
         session.commit()
@@ -334,7 +333,6 @@ def get_serve_launch_prefs(
             "spec_path": row.spec_path,
             "host": row.host,
             "port": row.port,
-            "reconcile": bool(row.reconcile),
             "ssl_certfile": row.ssl_certfile,
             "ssl_keyfile": row.ssl_keyfile,
         }
