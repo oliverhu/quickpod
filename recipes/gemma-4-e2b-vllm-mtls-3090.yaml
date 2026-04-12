@@ -11,7 +11,7 @@
 #   uv run python scripts/smoke_e2e_proxy.py --spec recipes/gemma-4-e2b-vllm-mtls-3090.yaml --clean-start --worker-wait-sec 7200
 
 name: recipe-gemma-4-e2b-mtls
-num_nodes: 1
+num_nodes: 2
 reconcile_interval_seconds: 120
 
 resources:

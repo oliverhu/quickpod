@@ -212,7 +212,7 @@ Plain HTTP from quickpod to workers. Your `setup` / `run` run as-is; you bind se
 
 ### `secure_mode: true`
 
-mTLS + HTTPS on the worker. Reconcile injects Caddy, PEMs, and a small loopback server for `GET /quickpod/logs`. Your `**run`** should start the app on `**127.0.0.1:18000**` only; do not bind `worker_api_port` yourself. Distinct `quickpod_service_port` and `worker_api_port` are required when `replica_log_http` is enabled (or omit `quickpod_service_port` to auto-pick a random port).
+mTLS + HTTPS on the worker. Reconcile injects Caddy, PEMs, and a loopback monitor for `GET /quickpod/logs` (and related paths). Caddy serves **`/quickpod/*` on the same TLS port as `/v1`** (`worker_api_port`) so RunPod only needs one public HTTPS mapping. Your `**run`** should start the app on `**127.0.0.1:18000**` only; do not bind `worker_api_port` yourself. With `replica_log_http: true`, omit `quickpod_service_port` (it is forced equal to `worker_api_port` for validation).
 
 `resources.mtls`: inline PEMs or `*_file` paths relative to the YAML. Set `verify_server_hostname: false` when workers use public IPs and the cert CN is `localhost`.
 
@@ -222,7 +222,7 @@ Full vLLM-style example: `examples/cluster.yaml`. Certs: `scripts/gen_mtls_certs
 | Field              | Meaning (secure mode)                                              |
 | ------------------ | ------------------------------------------------------------------ |
 | `worker_api_port`       | Caddy TLS port; quickpod proxies `/v1` here                                              |
-| `quickpod_service_port` | Caddy TLS for `/quickpod/logs` etc.; omit for a random port merged into `ports`         |
+| `quickpod_service_port` | Plain HTTP: separate sidecar port (random default). **Secure:** same as `worker_api_port` (path-routed). |
 | `managed_log_file`      | File tailed for `/quickpod/logs` (default `/workspace/replica.log`)                      |
 
 

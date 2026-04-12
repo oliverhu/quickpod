@@ -1,7 +1,7 @@
 """Inject Caddy + managed monitoring when ``replica_log_http`` is true.
 
 - **``secure_mode: true`` (mTLS):** user ``run`` binds the workload on **127.0.0.1:18000**; quickpod
-  adds Caddy on ``worker_api_port`` / ``quickpod_service_port`` and a monitor on loopback **18888**
+  adds Caddy on ``worker_api_port`` (``/quickpod/*`` → monitor on loopback **18888**, ``/v1`` → workload)
   (``GET /quickpod/logs``, ``GET /quickpod/system``, ``GET /quickpod/status``), using ``resources.mtls`` PEMs.
 - **``secure_mode: false``:** quickpod writes and starts the same monitor on **0.0.0.0:log_port**;
   your ``run`` must bind **only** ``worker_api_port`` (distinct from the log port).
@@ -31,12 +31,7 @@ def managed_worker_validate(resources: ResourcesSpec) -> None:
     if resources.replica_log_http:
         lp = replica_log_http_port(resources)
         if lp is None:
-            raise ValueError("replica_log_http enabled but no quickpod_service_port / ports")
-        if lp == resources.worker_api_port:
-            raise ValueError(
-                "secure_mode with replica_log_http requires distinct "
-                "quickpod_service_port and worker_api_port (two Caddy listeners)"
-            )
+            raise ValueError("replica_log_http enabled but no worker_api_port / ports")
 
 
 def _tls_site_directive(cert_path: str, key_path: str) -> str:
@@ -54,7 +49,12 @@ def _tls_site_directive(cert_path: str, key_path: str) -> str:
 
 
 def _caddyfile_body(resources: ResourcesSpec) -> str:
-    """mTLS PEMs from spec; ``auto_https off`` avoids ACME."""
+    """mTLS PEMs from spec; ``auto_https off`` avoids ACME.
+
+    With ``replica_log_http``, ``/quickpod/*`` is served on the **same** TLS site as the API
+    (``worker_api_port`` only) so RunPod maps a single public HTTPS port — a second listener
+    often fails or is unreachable from the control plane.
+    """
     assert resources.worker_api_port is not None
     api_pub = resources.worker_api_port
     api_cert = "/workspace/quickpod-mtls/server.pem"
@@ -67,19 +67,23 @@ def _caddyfile_body(resources: ResourcesSpec) -> str:
         "}",
         f":{api_pub} {{",
         _tls_site_directive(api_cert, api_key),
-        f"  reverse_proxy 127.0.0.1:{_LOOPBACK_API_PORT}",
-        "}",
     ]
     if resources.replica_log_http:
-        lp = replica_log_http_port(resources)
-        assert lp is not None
-        log_cert = "/workspace/quickpod-mtls/server.pem"
-        log_key = "/workspace/quickpod-mtls/server.key"
         parts.extend(
             [
-                f":{lp} {{",
-                _tls_site_directive(log_cert, log_key),
-                f"  reverse_proxy 127.0.0.1:{_LOOPBACK_LOG_HTTP_PORT}",
+                "  handle /quickpod/* {",
+                f"    reverse_proxy 127.0.0.1:{_LOOPBACK_LOG_HTTP_PORT}",
+                "  }",
+                "  handle {",
+                f"    reverse_proxy 127.0.0.1:{_LOOPBACK_API_PORT}",
+                "  }",
+                "}",
+            ]
+        )
+    else:
+        parts.extend(
+            [
+                f"  reverse_proxy 127.0.0.1:{_LOOPBACK_API_PORT}",
                 "}",
             ]
         )
@@ -459,7 +463,7 @@ def managed_setup_block(resources: ResourcesSpec, health: HealthCheckSpec | None
         [
             "/usr/local/bin/caddy fmt --overwrite /workspace/Caddyfile",
             "/usr/local/bin/caddy validate --config /workspace/Caddyfile --adapter caddyfile",
-            'echo "quickpod: starting caddy (TLS on worker_api_port and quickpod_service_port)"',
+            'echo "quickpod: starting caddy (TLS on worker_api_port: /v1 + /quickpod/*)"',
         ]
     )
 

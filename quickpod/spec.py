@@ -101,8 +101,10 @@ class ResourcesSpec(BaseModel):
         default=None,
         description=(
             "Container port for the quickpod sidecar (GET /quickpod/logs, /quickpod/system, /quickpod/status). "
-            "If omitted, a random port in 30000–49151 is chosen (not equal to worker_api_port) and merged "
-            "into resources.ports. If set, it is merged into ports when missing."
+            "When secure_mode is false: if omitted, a random port in 30000–49151 is chosen (not equal to "
+            "worker_api_port) and merged into resources.ports. When secure_mode is true, Caddy serves "
+            "/quickpod/* on worker_api_port (single published HTTPS port); this field is set equal to "
+            "worker_api_port for validation."
         ),
     )
     worker_api_port: int | None = Field(
@@ -139,6 +141,14 @@ class ResourcesSpec(BaseModel):
     container_disk_in_gb: int = Field(default=50, ge=10)
     support_public_ip: bool = True
     start_ssh: bool = True
+    quickpod_allocation_seed: str | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Internal: when quickpod_service_port is omitted, used as RNG seed so the chosen port "
+            "is stable for a given cluster name (injected by ClusterSpec)."
+        ),
+    )
 
     @field_validator("quickpod_service_port")
     @classmethod
@@ -185,16 +195,23 @@ class ResourcesSpec(BaseModel):
             raise ValueError("For compute_type GPU, gpu_count must be >= 1")
         if s.replica_log_http:
             wp = s.worker_api_port
-            qp = s.quickpod_service_port
             ports_list = list(s.ports)
-            if qp is None:
-                qp = _allocate_quickpod_service_port(wp, ports_list)
-            if wp is not None and qp == wp:
-                raise ValueError(
-                    "replica_log_http requires distinct quickpod_service_port and worker_api_port"
-                )
-            ports_final = sorted(set(ports_list) | {qp})
-            s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
+            if s.secure_mode and wp is not None:
+                qp = wp
+                ports_final = sorted({wp} | set(ports_list))
+                s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
+            else:
+                qp = s.quickpod_service_port
+                if qp is None:
+                    qp = _allocate_quickpod_service_port(
+                        wp, ports_list, seed=s.quickpod_allocation_seed
+                    )
+                if wp is not None and qp == wp:
+                    raise ValueError(
+                        "replica_log_http requires distinct quickpod_service_port and worker_api_port"
+                    )
+                ports_final = sorted(set(ports_list) | {qp})
+                s = s.model_copy(update={"quickpod_service_port": qp, "ports": ports_final})
         if s.worker_api_port is not None and s.worker_api_port not in s.ports:
             raise ValueError(
                 f"worker_api_port {s.worker_api_port} must be in resources.ports"
@@ -202,13 +219,6 @@ class ResourcesSpec(BaseModel):
         if s.secure_mode:
             if s.worker_api_port is None:
                 raise ValueError("secure_mode: true requires worker_api_port")
-            if s.replica_log_http:
-                lp = s.quickpod_service_port
-                if lp is not None and lp == s.worker_api_port:
-                    raise ValueError(
-                        "secure_mode with replica_log_http requires distinct "
-                        "quickpod_service_port and worker_api_port"
-                    )
             for name in (
                 "ca_pem",
                 "client_cert_pem",
@@ -251,13 +261,19 @@ class ResourcesSpec(BaseModel):
 def _allocate_quickpod_service_port(
     worker_api_port: int | None,
     ports: list[int],
+    *,
+    seed: str | None = None,
 ) -> int:
     """Pick a port in 30000–49151 not used by worker_api_port or listed ports."""
     taken: set[int] = set(ports)
     if worker_api_port is not None:
         taken.add(worker_api_port)
+    if seed:
+        rng = random.Random(hash(seed) & 0x7FFFFFFF or 1)
+    else:
+        rng = random.Random()
     for _ in range(512):
-        p = random.randint(30000, 49151)
+        p = rng.randint(30000, 49151)
         if p not in taken:
             return p
     raise ValueError(
@@ -288,9 +304,15 @@ class HealthCheckSpec(BaseModel):
 
 
 def replica_log_http_port(resources: ResourcesSpec) -> int | None:
-    """Private port mapped for GET /quickpod/logs and /quickpod/system on replicas, or None."""
+    """Port quickpod uses to reach GET /quickpod/logs, /quickpod/system, /quickpod/status on replicas.
+
+    For ``secure_mode: true``, this is ``worker_api_port`` (same mTLS site as ``/v1``; Caddy routes by path).
+    For plain HTTP, it is ``quickpod_service_port`` (separate listener).
+    """
     if not resources.replica_log_http:
         return None
+    if resources.secure_mode and resources.worker_api_port is not None:
+        return resources.worker_api_port
     qp = resources.quickpod_service_port
     if qp is None:
         raise RuntimeError("ResourcesSpec.quickpod_service_port unset — validate the model first")
@@ -301,6 +323,23 @@ class ClusterSpec(BaseModel):
     """Desired state for a logical cluster (RunPod pods are named ``{name}-{8 hex}``)."""
 
     name: str = Field(min_length=1, pattern=r"^[a-z0-9][a-z0-9-]*$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def inject_quickpod_allocation_seed(cls, data: Any) -> Any:
+        """Stable default quickpod_service_port per cluster name (dashboard + RunPod mappings stay aligned)."""
+        if not isinstance(data, dict):
+            return data
+        name = data.get("name")
+        res = data.get("resources")
+        if not isinstance(name, str) or not isinstance(res, dict):
+            return data
+        res = dict(res)
+        if res.get("quickpod_service_port") is None and res.get("replica_log_http", True) is not False:
+            res["quickpod_allocation_seed"] = name
+        out = dict(data)
+        out["resources"] = res
+        return out
     num_nodes: int = Field(ge=1)
     reconcile_interval_seconds: int = Field(default=60, ge=5)
     resources: ResourcesSpec = Field(default_factory=ResourcesSpec)

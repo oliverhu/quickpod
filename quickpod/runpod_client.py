@@ -17,7 +17,7 @@ from runpod.error import QueryError
 from quickpod.graphql_pod import deploy_gpu_pod
 from quickpod.managed_worker import build_container_startup_script
 from quickpod.monitoring_paths import MONITOR_LOGS_PATH, MONITOR_STATUS_PATH, MONITOR_SYSTEM_PATH
-from quickpod.spec import ClusterSpec
+from quickpod.spec import ClusterSpec, replica_log_http_port
 from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
 
 logger = logging.getLogger(__name__)
@@ -189,6 +189,30 @@ def count_ready_nodes(pods: list[dict[str, Any]]) -> int:
     return n
 
 
+def _coerce_port_int(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _runtime_entry_private_port(entry: dict[str, Any]) -> int | None:
+    for key in ("privatePort", "private", "containerPort", "port"):
+        if key in entry:
+            p = _coerce_port_int(entry.get(key))
+            if p is not None:
+                return p
+    return None
+
+
+def _runtime_entry_host(entry: dict[str, Any]) -> str | None:
+    for key in ("ip", "host", "publicIp", "podIp"):
+        v = entry.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
 def public_http_endpoint(
     pod: dict[str, Any], private_port: int
 ) -> tuple[str, int] | None:
@@ -200,18 +224,77 @@ def public_http_endpoint(
     for entry in ports:
         if not isinstance(entry, dict):
             continue
-        priv = entry.get("privatePort")
-        pub = entry.get("publicPort")
-        ip = entry.get("ip")
-        if priv is None or pub is None or not ip:
-            continue
-        try:
-            priv_i = int(priv)
-            pub_i = int(pub)
-        except (TypeError, ValueError):
+        priv_i = _runtime_entry_private_port(entry)
+        pub_i = _coerce_port_int(entry.get("publicPort"))
+        ip = _runtime_entry_host(entry)
+        if priv_i is None or pub_i is None or not ip:
             continue
         if priv_i == private_port:
-            return (str(ip), pub_i)
+            return (ip, pub_i)
+    return None
+
+
+def _runtime_private_ports(pod: dict[str, Any]) -> list[int]:
+    rt = pod.get("runtime") or {}
+    ports = rt.get("ports")
+    if not isinstance(ports, list):
+        return []
+    out: list[int] = []
+    for entry in ports:
+        if not isinstance(entry, dict):
+            continue
+        p = _runtime_entry_private_port(entry)
+        if p is not None:
+            out.append(p)
+    return out
+
+
+def infer_replica_monitor_private_port(pod: dict[str, Any], spec: ClusterSpec) -> int | None:
+    """When spec quickpod port does not match RunPod mappings, infer sidecar private port from runtime."""
+    wp = spec.resources.worker_api_port
+    preferred = replica_log_http_port(spec.resources)
+    if preferred is None:
+        return None
+    privs = _runtime_private_ports(pod)
+    non_std = [p for p in privs if wp is None or p != wp]
+    non_std = [p for p in non_std if p != 22]
+    if not non_std:
+        return None
+    if len(non_std) == 1:
+        return non_std[0]
+    if preferred in non_std:
+        return preferred
+    ephem = [p for p in non_std if 30000 <= p <= 49151]
+    if len(ephem) == 1:
+        return ephem[0]
+    if ephem:
+        return min(ephem)
+    return min(non_std)
+
+
+def resolve_replica_monitor_public_endpoint(
+    pod: dict[str, Any],
+    spec: ClusterSpec,
+    preferred_private: int,
+) -> tuple[str, int] | None:
+    """Resolve (host, public_port) for replica monitor HTTPS/HTTP, with inference + alternate keys."""
+    ep = public_http_endpoint(pod, preferred_private)
+    if ep:
+        return ep
+    alt = infer_replica_monitor_private_port(pod, spec)
+    if alt is not None:
+        ep = public_http_endpoint(pod, alt)
+        if ep:
+            return ep
+    return None
+
+
+def _refresh_pod_by_id(
+    cluster_name: str, pod_id: str, *, api_key: str | None
+) -> dict[str, Any] | None:
+    for p in list_managed_pods(cluster_name, api_key=api_key):
+        if str(p.get("id")) == str(pod_id):
+            return p
     return None
 
 
@@ -224,9 +307,24 @@ def _fetch_replica_http_get(
     tls_insecure: bool | None = None,
     timeout_sec: float = 8.0,
     spec: ClusterSpec | None = None,
+    cluster_name: str | None = None,
+    api_key: str | None = None,
 ) -> str:
     """GET monitor path from a running pod; returns body or parenthesized error line."""
-    ep = public_http_endpoint(pod, private_port)
+    work_pod = pod
+
+    def _resolve_ep(p: dict[str, Any]) -> tuple[str, int] | None:
+        if spec is not None:
+            return resolve_replica_monitor_public_endpoint(p, spec, private_port)
+        return public_http_endpoint(p, private_port)
+
+    ep = _resolve_ep(work_pod)
+    if not ep and cluster_name and api_key and work_pod.get("id"):
+        time.sleep(0.35)
+        fresh = _refresh_pod_by_id(cluster_name, str(work_pod["id"]), api_key=api_key)
+        if fresh is not None:
+            work_pod = fresh
+            ep = _resolve_ep(work_pod)
     if not ep:
         return "(no public endpoint yet — pod may still be provisioning)\n"
     host, port = ep
@@ -282,6 +380,8 @@ def fetch_replica_http_log(
     tls_insecure: bool | None = None,
     timeout_sec: float = 8.0,
     spec: ClusterSpec | None = None,
+    cluster_name: str | None = None,
+    api_key: str | None = None,
 ) -> str:
     """GET log text from the replica monitoring sidecar (default ``/quickpod/logs``)."""
     return _fetch_replica_http_get(
@@ -292,6 +392,8 @@ def fetch_replica_http_log(
         tls_insecure=tls_insecure,
         timeout_sec=timeout_sec,
         spec=spec,
+        cluster_name=cluster_name,
+        api_key=api_key,
     )
 
 
@@ -304,6 +406,8 @@ def fetch_replica_system_snapshot(
     tls_insecure: bool | None = None,
     timeout_sec: float = 8.0,
     spec: ClusterSpec | None = None,
+    cluster_name: str | None = None,
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """GET JSON system metrics from the replica monitoring sidecar (default ``/quickpod/system``)."""
     raw = _fetch_replica_http_get(
@@ -314,6 +418,8 @@ def fetch_replica_system_snapshot(
         tls_insecure=tls_insecure,
         timeout_sec=timeout_sec,
         spec=spec,
+        cluster_name=cluster_name,
+        api_key=api_key,
     )
     if raw.startswith("("):
         return {"error": raw.strip()}
@@ -335,6 +441,8 @@ def fetch_replica_status_snapshot(
     tls_insecure: bool | None = None,
     timeout_sec: float = 8.0,
     spec: ClusterSpec | None = None,
+    cluster_name: str | None = None,
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """GET JSON lifecycle/health status from the replica monitor (default ``/quickpod/status``)."""
     raw = _fetch_replica_http_get(
@@ -345,6 +453,8 @@ def fetch_replica_status_snapshot(
         tls_insecure=tls_insecure,
         timeout_sec=timeout_sec,
         spec=spec,
+        cluster_name=cluster_name,
+        api_key=api_key,
     )
     if raw.startswith("("):
         return {"error": raw.strip(), "lifecycle": "unknown", "status": "unknown"}

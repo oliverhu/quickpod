@@ -405,7 +405,7 @@ def build_app(
             "ready": ready,
             "shortage_alive": max(0, spec.num_nodes - alive),
             "shortage_ready": max(0, spec.num_nodes - ready),
-            "replicas": [_replica_view(spec, p, http_port) for p in pods],
+            "replicas": [_replica_view(spec, p, http_port, api_key=api_key) for p in pods],
             "replica_log_http": http_port is not None,
             "replica_log_port": http_port,
             "openai_proxy_path": "/v1",
@@ -509,6 +509,8 @@ def build_app(
                     use_https=spec.resources.secure_mode,
                     tls_insecure=False,
                     spec=spec,
+                    cluster_name=spec.name,
+                    api_key=api_key,
                 )
                 return PlainTextResponse(text)
         raise HTTPException(status_code=404, detail="pod not found")
@@ -528,6 +530,8 @@ def build_app(
                     use_https=spec.resources.secure_mode,
                     tls_insecure=False,
                     spec=spec,
+                    cluster_name=spec.name,
+                    api_key=api_key,
                 )
                 return JSONResponse(data)
         raise HTTPException(status_code=404, detail="pod not found")
@@ -547,6 +551,8 @@ def build_app(
                     use_https=spec.resources.secure_mode,
                     tls_insecure=False,
                     spec=spec,
+                    cluster_name=spec.name,
+                    api_key=api_key,
                 )
                 return JSONResponse(data)
         raise HTTPException(status_code=404, detail="pod not found")
@@ -596,6 +602,7 @@ def _replica_view(
     pod: dict[str, Any],
     http_port: int | None,
     *,
+    api_key: str,
     log_max: int = _LOG_PREVIEW_FETCH_MAX,
 ) -> dict[str, Any]:
     pid = str(pod.get("id") or "")
@@ -622,6 +629,8 @@ def _replica_view(
         use_https=use_https,
         tls_insecure=tls_insecure,
         spec=spec,
+        cluster_name=spec.name,
+        api_key=api_key,
     )
     preview = _tail_for_preview(preview, log_max)
     system = fetch_replica_system_snapshot(
@@ -630,6 +639,8 @@ def _replica_view(
         use_https=use_https,
         tls_insecure=tls_insecure,
         spec=spec,
+        cluster_name=spec.name,
+        api_key=api_key,
     )
     quickpod_status = fetch_replica_status_snapshot(
         pod,
@@ -637,6 +648,8 @@ def _replica_view(
         use_https=use_https,
         tls_insecure=tls_insecure,
         spec=spec,
+        cluster_name=spec.name,
+        api_key=api_key,
     )
     return {
         "id": pid,
