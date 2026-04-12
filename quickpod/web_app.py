@@ -33,6 +33,7 @@ from quickpod.runpod_client import (
     list_managed_pods,
 )
 from quickpod.spec import ClusterSpec, replica_log_http_port
+from quickpod.serve_daemon_mgmt import stop_cluster_and_runpod
 from quickpod.worker_http import httpx_worker_client_kwargs, httpx_worker_tls_extensions
 from quickpod.worker_pool import WorkerRing, lb_ready_worker_bases, worker_base_urls
 
@@ -228,11 +229,39 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       border-bottom: 1px solid var(--border);
     }}
     footer {{ margin-top: 2rem; font-size: 0.75rem; color: var(--muted); }}
+    .cluster-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.65rem 1rem;
+      margin-bottom: 1.25rem;
+      padding: 0.65rem 0.85rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }}
+    .cluster-actions-note {{ font-size: 0.8rem; color: var(--muted); max-width: 52rem; line-height: 1.4; }}
+    button.btn-stop {{
+      cursor: pointer;
+      padding: 0.4rem 0.75rem;
+      border-radius: 8px;
+      border: 1px solid #8b4450;
+      background: #3d2028;
+      color: var(--text);
+      font-size: 0.85rem;
+      font-weight: 600;
+    }}
+    button.btn-stop:hover {{ filter: brightness(1.08); }}
+    button.btn-stop:disabled {{ opacity: 0.55; cursor: not-allowed; }}
   </style>
 </head>
 <body data-desired="{num_nodes}" data-api-prefix="{api_prefix}">
   <h1>Cluster <code>{cluster_name}</code></h1>
   <p class="sub">Desired <strong>{num_nodes}</strong> replicas · <span id="update-hint">updating…</span></p>
+  <div class="cluster-actions">
+    <button type="button" class="btn-stop" id="btn-stop-cluster">Stop cluster</button>
+    <span class="cluster-actions-note">Terminate RunPod pods for this cluster and stop the local <code>serve</code> process if one is registered (same as <code>quickpod clusters stop</code>). The cluster row stays in the local store.</span>
+  </div>
   <div class="api-box" id="api-proxy-hint">
     <strong>OpenAI-compatible API</strong> (round-robin to RUNNING workers):<br/>
     <code id="openai-base">…</code>
@@ -397,6 +426,38 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     scrollLogPresToBottom();
     refresh();
     setInterval(refresh, 5000);
+
+    const stopBtn = document.getElementById('btn-stop-cluster');
+    if (stopBtn) {{
+      stopBtn.addEventListener('click', async function () {{
+        const msg = 'Stop this cluster? This terminates RunPod pods and stops the local serve process if running. The cluster row stays in the local store.';
+        try {{
+          if (typeof window.confirm === 'function' && !window.confirm(msg)) return;
+        }} catch (e1) {{ return; }}
+        stopBtn.disabled = true;
+        try {{
+          const res = await fetch(qp('/api/cluster/stop'), {{ method: 'POST', cache: 'no-store' }});
+          let body = {{}};
+          try {{ body = await res.json(); }} catch (e2) {{}}
+          if (!res.ok) {{
+            const d = body.detail != null ? String(body.detail) : res.status + ' ' + res.statusText;
+            window.alert('Stop failed: ' + d);
+            stopBtn.disabled = false;
+            return;
+          }}
+          const ids = body.terminated_pod_ids || [];
+          const had = body.stopped_local_daemon;
+          window.alert(
+            'Cluster stop issued.\\nTerminated pods: ' + (ids.length ? ids.join(', ') : '(none)') +
+            '\\nLocal serve daemon stopped: ' + (had ? 'yes' : 'no') +
+            '\\n\\nIf you used a background daemon, this page may stop responding.'
+          );
+        }} catch (e3) {{
+          window.alert('Request failed (stop may still have been issued): ' + (e3 && e3.message ? e3.message : e3));
+        }}
+        stopBtn.disabled = false;
+      }});
+    }}
   }});
 }})();
   </script>
@@ -410,6 +471,7 @@ def build_app(
     api_key: str,
     *,
     public_path_prefix: str = "",
+    database_url: str | None = None,
 ) -> FastAPI:
     ensure_quickpod_service_log_handler()
     http_port = replica_log_http_port(spec.resources)
@@ -603,6 +665,26 @@ def build_app(
     @app.get("/api/cluster")
     def api_cluster() -> JSONResponse:
         return JSONResponse(_snapshot())
+
+    @app.post("/api/cluster/stop")
+    def api_cluster_stop() -> JSONResponse:
+        try:
+            had_daemon, pod_ids = stop_cluster_and_runpod(
+                spec.name, api_key, database_url=database_url
+            )
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "stopped_local_daemon": had_daemon,
+                    "terminated_pod_ids": pod_ids,
+                }
+            )
+        except Exception as e:
+            _log.exception("cluster stop from UI failed")
+            return JSONResponse(
+                {"ok": False, "detail": str(e)},
+                status_code=500,
+            )
 
     @app.get("/api/local-service-log", response_class=PlainTextResponse)
     def api_local_service_log() -> PlainTextResponse:

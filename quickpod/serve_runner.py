@@ -49,7 +49,7 @@ def run_serve(
 
     from quickpod.web_app import build_app
 
-    app = build_app(spec, api_key)
+    app = build_app(spec, api_key, database_url=database_url)
     try:
         kw: dict = dict(
             app=app,

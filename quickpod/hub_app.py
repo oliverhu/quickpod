@@ -260,7 +260,10 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
         return _hub_redirect_index(request)
 
     for _name, spec, prefix in to_mount:
-        app.mount(prefix, build_app(spec, api_key, public_path_prefix=prefix))
+        app.mount(
+            prefix,
+            build_app(spec, api_key, public_path_prefix=prefix, database_url=database_url),
+        )
 
     return app
 
