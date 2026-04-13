@@ -253,6 +253,19 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     }}
     button.btn-stop:hover {{ filter: brightness(1.08); }}
     button.btn-stop:disabled {{ opacity: 0.55; cursor: not-allowed; }}
+    .qp-modal-root {{ position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; }}
+    .qp-modal-root[hidden] {{ display: none !important; }}
+    .qp-modal-backdrop {{ position: absolute; inset: 0; background: rgba(0,0,0,0.55); }}
+    .qp-modal-panel {{
+      position: relative; z-index: 1; max-width: 28rem; margin: 1rem; padding: 1rem 1.1rem;
+      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    }}
+    .qp-modal-panel p {{ margin: 0 0 1rem; white-space: pre-wrap; line-height: 1.45; font-size: 0.9rem; }}
+    .qp-modal-actions {{ display: flex; justify-content: flex-end; gap: 0.5rem; flex-wrap: wrap; }}
+    .qp-modal-actions button {{ min-width: 5rem; cursor: pointer; padding: 0.35rem 0.65rem; border-radius: 8px;
+      border: 1px solid var(--border); background: #2a3d5a; color: var(--text); font-size: 0.85rem; }}
+    .qp-modal-actions button.qp-primary {{ background: #3d2028; border-color: #8b4450; font-weight: 600; }}
   </style>
 </head>
 <body data-desired="{num_nodes}" data-api-prefix="{api_prefix}">
@@ -283,6 +296,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </article>
   </div>
   <footer>quickpod · <code>/api/cluster</code> · replica monitor: {log_footer} · workers reached over HTTPS by this service only</footer>
+  <div id="qp-dlg" class="qp-modal-root" hidden aria-hidden="true">
+    <div class="qp-modal-backdrop" data-qp-close="1"></div>
+    <div class="qp-modal-panel" role="dialog" aria-modal="true" aria-labelledby="qp-dlg-text">
+      <p id="qp-dlg-text"></p>
+      <div class="qp-modal-actions">
+        <button type="button" id="qp-dlg-cancel">Cancel</button>
+        <button type="button" class="qp-primary" id="qp-dlg-ok">OK</button>
+      </div>
+    </div>
+  </div>
   <script>
 (function () {{
   const desired = parseInt(document.body.getAttribute('data-desired') || '0', 10);
@@ -307,6 +330,72 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     const t = String(s || '');
     if (t.length <= maxChars) return t;
     return '…(older log truncated)…\\n' + t.slice(-maxChars);
+  }}
+
+  const qpDlg = document.getElementById('qp-dlg');
+  const qpDlgText = document.getElementById('qp-dlg-text');
+  const qpDlgCancel = document.getElementById('qp-dlg-cancel');
+  const qpDlgOk = document.getElementById('qp-dlg-ok');
+
+  function qpCloseModal() {{
+    qpDlg.hidden = true;
+    qpDlg.setAttribute('aria-hidden', 'true');
+  }}
+
+  function qpConfirmPromise(message) {{
+    return new Promise(function (resolve) {{
+      function finish(v) {{
+        qpCloseModal();
+        qpDlg.removeEventListener('click', onRootClick);
+        document.removeEventListener('keydown', onEsc);
+        qpDlgCancel.removeEventListener('click', onCancel);
+        qpDlgOk.removeEventListener('click', onOk);
+        resolve(v);
+      }}
+      function onCancel() {{ finish(false); }}
+      function onOk() {{ finish(true); }}
+      function onEsc(ev) {{ if (ev.key === 'Escape') {{ ev.preventDefault(); onCancel(); }} }}
+      function onRootClick(ev) {{
+        if (ev.target && ev.target.getAttribute('data-qp-close')) onCancel();
+      }}
+      qpDlgText.textContent = message;
+      qpDlgCancel.style.display = '';
+      qpDlgOk.textContent = 'Stop';
+      qpDlg.hidden = false;
+      qpDlg.setAttribute('aria-hidden', 'false');
+      qpDlg.addEventListener('click', onRootClick);
+      qpDlgCancel.addEventListener('click', onCancel);
+      qpDlgOk.addEventListener('click', onOk);
+      document.addEventListener('keydown', onEsc);
+      qpDlgOk.focus();
+    }});
+  }}
+
+  function qpAlertPromise(message) {{
+    return new Promise(function (resolve) {{
+      function finish() {{
+        qpCloseModal();
+        qpDlg.removeEventListener('click', onRootClick);
+        document.removeEventListener('keydown', onEsc);
+        qpDlgOk.removeEventListener('click', onOk);
+        qpDlgCancel.style.display = '';
+        resolve();
+      }}
+      function onOk() {{ finish(); }}
+      function onEsc(ev) {{ if (ev.key === 'Escape') {{ ev.preventDefault(); onOk(); }} }}
+      function onRootClick(ev) {{
+        if (ev.target && ev.target.getAttribute('data-qp-close')) onOk();
+      }}
+      qpDlgText.textContent = message;
+      qpDlgCancel.style.display = 'none';
+      qpDlgOk.textContent = 'OK';
+      qpDlg.hidden = false;
+      qpDlg.setAttribute('aria-hidden', 'false');
+      qpDlg.addEventListener('click', onRootClick);
+      qpDlgOk.addEventListener('click', onOk);
+      document.addEventListener('keydown', onEsc);
+      qpDlgOk.focus();
+    }});
   }}
 
   function formatSystem(s) {{
@@ -431,9 +520,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     if (stopBtn) {{
       stopBtn.addEventListener('click', async function () {{
         const msg = 'Stop this cluster? This terminates RunPod pods and stops the local serve process if running. The cluster row stays in the local store.';
-        try {{
-          if (typeof window.confirm === 'function' && !window.confirm(msg)) return;
-        }} catch (e1) {{ return; }}
+        if (!(await qpConfirmPromise(msg))) return;
         stopBtn.disabled = true;
         try {{
           const res = await fetch(qp('/api/cluster/stop'), {{ method: 'POST', cache: 'no-store' }});
@@ -441,19 +528,19 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           try {{ body = await res.json(); }} catch (e2) {{}}
           if (!res.ok) {{
             const d = body.detail != null ? String(body.detail) : res.status + ' ' + res.statusText;
-            window.alert('Stop failed: ' + d);
+            await qpAlertPromise('Stop failed: ' + d);
             stopBtn.disabled = false;
             return;
           }}
           const ids = body.terminated_pod_ids || [];
           const had = body.stopped_local_daemon;
-          window.alert(
+          await qpAlertPromise(
             'Cluster stop issued.\\nTerminated pods: ' + (ids.length ? ids.join(', ') : '(none)') +
             '\\nLocal serve daemon stopped: ' + (had ? 'yes' : 'no') +
             '\\n\\nIf you used a background daemon, this page may stop responding.'
           );
         }} catch (e3) {{
-          window.alert('Request failed (stop may still have been issued): ' + (e3 && e3.message ? e3.message : e3));
+          await qpAlertPromise('Request failed (stop may still have been issued): ' + (e3 && e3.message ? e3.message : e3));
         }}
         stopBtn.disabled = false;
       }});

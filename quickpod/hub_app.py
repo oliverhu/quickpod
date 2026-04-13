@@ -202,6 +202,17 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
     button.danger {{ background: #3d2028; border-color: #8b4450; }}
     td.actions {{ white-space: nowrap; }}
     .muted {{ color: #8b9cb3; font-size: 0.8rem; }}
+    .qp-modal-root {{ position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; }}
+    .qp-modal-root[hidden] {{ display: none !important; }}
+    .qp-modal-backdrop {{ position: absolute; inset: 0; background: rgba(0,0,0,0.55); }}
+    .qp-modal-panel {{
+      position: relative; z-index: 1; max-width: 28rem; margin: 1rem; padding: 1rem 1.1rem;
+      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    }}
+    .qp-modal-panel p {{ margin: 0 0 1rem; white-space: pre-wrap; line-height: 1.45; }}
+    .qp-modal-actions {{ display: flex; justify-content: flex-end; gap: 0.5rem; }}
+    .qp-modal-actions button {{ min-width: 5rem; }}
   </style>
 </head>
 <body>
@@ -218,18 +229,58 @@ def build_hub_app(api_key: str, *, database_url: str | None = None) -> FastAPI:
       {table_body}
     </tbody>
   </table>
+  <div id="qp-hub-modal" class="qp-modal-root" hidden aria-hidden="true">
+    <div class="qp-modal-backdrop" data-qp-close="1"></div>
+    <div class="qp-modal-panel" role="dialog" aria-modal="true" aria-labelledby="qp-hub-modal-msg">
+      <p id="qp-hub-modal-msg"></p>
+      <div class="qp-modal-actions">
+        <button type="button" id="qp-hub-modal-cancel">Cancel</button>
+        <button type="button" class="danger" id="qp-hub-modal-ok">OK</button>
+      </div>
+    </div>
+  </div>
   <script>
   (function () {{
+    var root = document.getElementById("qp-hub-modal");
+    var msgEl = document.getElementById("qp-hub-modal-msg");
+    var okBtn = document.getElementById("qp-hub-modal-ok");
+    var cancelBtn = document.getElementById("qp-hub-modal-cancel");
+    var pendingForm = null;
+
+    function closeModal() {{
+      pendingForm = null;
+      root.hidden = true;
+      root.setAttribute("aria-hidden", "true");
+    }}
+
+    function openModal(message, form) {{
+      pendingForm = form;
+      msgEl.textContent = message;
+      root.hidden = false;
+      root.setAttribute("aria-hidden", "false");
+      okBtn.focus();
+    }}
+
+    okBtn.addEventListener("click", function () {{
+      var f = pendingForm;
+      closeModal();
+      if (f) f.submit();
+    }});
+    cancelBtn.addEventListener("click", closeModal);
+    root.addEventListener("click", function (ev) {{
+      if (ev.target && ev.target.getAttribute("data-qp-close")) closeModal();
+    }});
+    document.addEventListener("keydown", function (ev) {{
+      if (ev.key === "Escape" && !root.hidden) {{
+        ev.preventDefault();
+        closeModal();
+      }}
+    }});
+
     document.querySelectorAll("form[data-confirm]").forEach(function (form) {{
       form.addEventListener("submit", function (ev) {{
-        var msg = form.getAttribute("data-confirm") || "";
-        try {{
-          if (typeof window.confirm === "function" && !window.confirm(msg)) {{
-            ev.preventDefault();
-          }}
-        }} catch (e) {{
-          /* Embedded / restricted browsers: submit without blocking */
-        }}
+        ev.preventDefault();
+        openModal(form.getAttribute("data-confirm") || "", form);
       }});
     }});
   }})();

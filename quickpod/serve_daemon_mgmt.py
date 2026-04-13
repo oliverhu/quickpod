@@ -115,10 +115,15 @@ def stop_cluster_and_runpod(
     *,
     database_url: str | None = None,
 ) -> tuple[bool, list[str]]:
-    """Stop local OpenAI proxy (if running), terminate RunPod pods for the cluster. Keeps DB cluster row."""
+    """Terminate RunPod pods for the cluster, then stop the local OpenAI proxy if running.
+
+    RunPod termination must run **before** stopping the serve daemon: the daemon process is
+    often the same uvicorn worker handling ``POST /api/cluster/stop``, and killing it first
+    prevented ``terminate_managed_pods`` from running.
+    """
     configure_api(api_key)
-    had_daemon = stop_local_serve_daemon(cluster_name, database_url=database_url)
     ids = terminate_managed_pods(cluster_name, api_key=api_key)
+    had_daemon = stop_local_serve_daemon(cluster_name, database_url=database_url)
     return had_daemon, ids
 
 
@@ -133,7 +138,6 @@ def remove_cluster_completely(
     Returns ``(had_local_serve_daemon, terminated_pod_ids, store_row_deleted)``.
     """
     configure_api(api_key)
-    had_daemon = stop_local_serve_daemon(cluster_name, database_url=database_url)
     ids = terminate_managed_pods(cluster_name, api_key=api_key)
     deleted = False
     try:
@@ -141,6 +145,7 @@ def remove_cluster_completely(
         deleted = True
     except Exception as e:
         logger.warning("Could not remove cluster from store: %s", e)
+    had_daemon = stop_local_serve_daemon(cluster_name, database_url=database_url)
     return had_daemon, ids, deleted
 
 
