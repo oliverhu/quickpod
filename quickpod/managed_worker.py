@@ -150,6 +150,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import signal
 import socket
 import socketserver
@@ -460,6 +461,28 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         return
 
+    def do_HEAD(self):
+        p = _norm_path(self.path)
+        if p != "/quickpod/train-export":
+            self.send_response(404)
+            self.end_headers()
+            return
+        export = pathlib.Path("/workspace/quickpod-train-export.tar.gz")
+        if not export.is_file():
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            size = export.stat().st_size
+        except OSError:
+            self.send_response(500)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+
     def do_POST(self):
         p = _norm_path(self.path)
         if p != "/quickpod/swap-run":
@@ -508,6 +531,28 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(b)
+            return
+        if p == "/quickpod/train-export":
+            export = pathlib.Path("/workspace/quickpod-train-export.tar.gz")
+            if not export.is_file():
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                size = export.stat().st_size
+            except OSError:
+                self.send_response(500)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            try:
+                with open(export, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            except Exception:
+                return
             return
         self.send_response(404)
         self.end_headers()
@@ -623,7 +668,21 @@ def managed_edgeservices_background(resources: ResourcesSpec) -> str:
     )
 
 
-def managed_user_run_wait_caddy(user_run: str) -> str:
+def _bash_single_quoted(s: str) -> str:
+    """Wrap ``s`` in single quotes for bash (safe embedding in generated startup)."""
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def _train_shell_prefix(spec: ClusterSpec) -> str:
+    """If ``spec.train`` is set, assign ``train_remote_dir=...`` before user ``run`` (not RunPod envs)."""
+    t = spec.train
+    if t is None:
+        return ""
+    rp = t.remote_path_container()
+    return f"train_remote_dir={_bash_single_quoted(rp)}"
+
+
+def managed_user_run_wait_caddy(user_run: str, *, train_prefix: str = "") -> str:
     """Run user workload in background; block on Caddy (started earlier)."""
     ur = user_run.strip()
     if not ur:
@@ -631,7 +690,10 @@ def managed_user_run_wait_caddy(user_run: str) -> str:
             "secure_mode requires a non-empty run: script "
             f"(workload must listen on 127.0.0.1:{_LOOPBACK_API_PORT})"
         )
-    return "\n".join(
+    lines: list[str] = []
+    if train_prefix:
+        lines.append(train_prefix)
+    lines.extend(
         [
             "(",
             ur,
@@ -640,12 +702,17 @@ def managed_user_run_wait_caddy(user_run: str) -> str:
             'wait "${CADDY_PID:?quickpod: CADDY_PID unset (caddy did not start)}"',
         ]
     )
+    return "\n".join(lines) + "\n"
 
 
 def build_container_startup_script(spec: ClusterSpec) -> str:
     """Full bash script embedded as ORCH_B64."""
     header_plain = "#!/usr/bin/env bash\nset -euo pipefail\n"
     if not spec.resources.secure_mode:
+        tp = _train_shell_prefix(spec)
+        run_block = "(" + "\n" + spec.run.strip() + "\n) &\n"
+        if tp:
+            run_block = tp + "\n" + run_block
         return (
             header_plain
             + "mkdir -p /workspace\n"
@@ -657,9 +724,7 @@ def build_container_startup_script(spec: ClusterSpec) -> str:
             + "\n"
             + _shell_write_lifecycle("running")
             + "\n"
-            + "(\n"
-            + spec.run.strip()
-            + "\n) &\n"
+            + run_block
             + "echo $! > /workspace/quickpod-workload.pid\n"
             + "wait $!\n"
         )
@@ -684,6 +749,6 @@ def build_container_startup_script(spec: ClusterSpec) -> str:
         + "\n"
         + _shell_write_lifecycle("running")
         + "\n"
-        + managed_user_run_wait_caddy(spec.run)
+        + managed_user_run_wait_caddy(spec.run, train_prefix=_train_shell_prefix(spec))
         + "\n"
     )

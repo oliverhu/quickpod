@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 
 import httpx
 import uuid
@@ -21,6 +22,7 @@ from quickpod.monitoring_paths import (
     MONITOR_STATUS_PATH,
     MONITOR_SWAP_RUN_PATH,
     MONITOR_SYSTEM_PATH,
+    MONITOR_TRAIN_EXPORT_PATH,
 )
 from quickpod.spec import ClusterSpec, replica_log_http_port
 from quickpod.worker_http import httpx_log_fetch_kwargs, httpx_worker_tls_extensions
@@ -406,6 +408,127 @@ def _fetch_replica_http_get(
         return r.text
     except httpx.RequestError as e:
         return f"(could not reach {url}: {e})\n"
+
+
+def replica_train_export_ready(
+    pod: dict[str, Any],
+    private_port: int,
+    *,
+    spec: ClusterSpec,
+    cluster_name: str | None = None,
+    api_key: str | None = None,
+    timeout_sec: float = 30.0,
+) -> bool:
+    """True if ``HEAD /quickpod/train-export`` returns 200 (archive present on the replica)."""
+    work_pod = pod
+    if spec.resources.secure_mode and spec.resources.worker_api_port is not None:
+        private_port = int(spec.resources.worker_api_port)
+
+    def _resolve_ep(p: dict[str, Any]) -> tuple[str, int] | None:
+        return resolve_replica_monitor_public_endpoint(p, spec, private_port)
+
+    ep = _resolve_ep(work_pod)
+    if not ep and cluster_name and api_key and work_pod.get("id"):
+        time.sleep(0.2)
+        fresh = _refresh_pod_by_id(cluster_name, str(work_pod["id"]), api_key=api_key)
+        if fresh is not None:
+            work_pod = fresh
+            ep = _resolve_ep(work_pod)
+    if not ep:
+        return False
+    host, port = ep
+    use_https = bool(spec.resources.secure_mode)
+    url = f"{'https' if use_https else 'http'}://{host}:{port}{MONITOR_TRAIN_EXPORT_PATH}"
+    headers: dict[str, str] = {}
+    if use_https and spec.resources.secure_mode:
+        headers["Host"] = f"localhost:{port}"
+    tls_kw = httpx_log_fetch_kwargs(spec) if spec.resources.secure_mode else {
+        "verify": True,
+        "cert": None,
+    }
+    try:
+        with httpx.Client(
+            timeout=timeout_sec,
+            http2=False,
+            trust_env=False,
+            **tls_kw,
+        ) as c:
+            req = c.build_request("HEAD", url, headers=headers)
+            ex = httpx_worker_tls_extensions(spec)
+            if ex:
+                req.extensions = {**dict(req.extensions), **ex}
+            resp = c.send(req)
+            try:
+                return int(resp.status_code) == 200
+            finally:
+                resp.close()
+    except httpx.RequestError:
+        return False
+
+
+def fetch_replica_train_export_to_path(
+    pod: dict[str, Any],
+    private_port: int,
+    dest: Path,
+    *,
+    spec: ClusterSpec,
+    cluster_name: str | None = None,
+    api_key: str | None = None,
+    timeout_sec: float = 600.0,
+) -> int:
+    """GET ``/quickpod/train-export`` (mTLS when ``secure_mode``); stream response body to ``dest``.
+
+    Returns HTTP status code (200 on success). Caller should unlink ``dest`` on failure if needed.
+    """
+    work_pod = pod
+    if spec.resources.secure_mode and spec.resources.worker_api_port is not None:
+        private_port = int(spec.resources.worker_api_port)
+
+    def _resolve_ep(p: dict[str, Any]) -> tuple[str, int] | None:
+        return resolve_replica_monitor_public_endpoint(p, spec, private_port)
+
+    ep = _resolve_ep(work_pod)
+    if not ep and cluster_name and api_key and work_pod.get("id"):
+        time.sleep(0.35)
+        fresh = _refresh_pod_by_id(cluster_name, str(work_pod["id"]), api_key=api_key)
+        if fresh is not None:
+            work_pod = fresh
+            ep = _resolve_ep(work_pod)
+    if not ep:
+        return 0
+    host, port = ep
+    use_https = bool(spec.resources.secure_mode)
+    url = f"{'https' if use_https else 'http'}://{host}:{port}{MONITOR_TRAIN_EXPORT_PATH}"
+    headers: dict[str, str] = {}
+    if use_https and spec.resources.secure_mode:
+        headers["Host"] = f"localhost:{port}"
+    tls_kw = httpx_log_fetch_kwargs(spec) if spec.resources.secure_mode else {
+        "verify": True,
+        "cert": None,
+    }
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with httpx.Client(
+            timeout=timeout_sec,
+            http2=False,
+            trust_env=False,
+            **tls_kw,
+        ) as c:
+            req = c.build_request("GET", url, headers=headers)
+            ex = httpx_worker_tls_extensions(spec)
+            if ex:
+                req.extensions = {**dict(req.extensions), **ex}
+            resp = c.send(req)
+            try:
+                code = int(resp.status_code)
+                if code != 200:
+                    return code
+                dest.write_bytes(resp.content)
+                return 200
+            finally:
+                resp.close()
+    except httpx.RequestError:
+        return 0
 
 
 def post_replica_swap_run(

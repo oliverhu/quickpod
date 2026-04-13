@@ -276,6 +276,47 @@ def _allocate_quickpod_service_port(
     )
 
 
+class TrainSpec(BaseModel):
+    """Paths for ``quickpod train`` (bundle on the worker, extract on the host).
+
+    ``remote_dir`` must be an **absolute** path inside the container (e.g. ``/workspace/checkpoints``).
+    Before your ``run:`` script runs, quickpod sets the bash variable ``train_remote_dir`` to this
+    path (not via RunPod ``envs``).
+
+    ``local_dir`` is where ``quickpod train`` extracts the downloaded tarball on **this machine**
+    (never sent to RunPod).
+
+    Your ``run:`` should create ``/workspace/quickpod-train-export.tar.gz``, e.g.::
+
+        tar czf /workspace/quickpod-train-export.tar.gz -C "$(dirname "$train_remote_dir")" "$(basename "$train_remote_dir")"
+    """
+
+    remote_dir: str = Field(min_length=1)
+    local_dir: str = Field(min_length=1)
+
+    @field_validator("remote_dir")
+    @classmethod
+    def remote_dir_absolute(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("train.remote_dir must be non-empty")
+        if not s.startswith("/"):
+            raise ValueError("train.remote_dir must be an absolute path (e.g. /workspace/checkpoints)")
+        return s
+
+    @field_validator("local_dir")
+    @classmethod
+    def strip_local_dir(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("train.local_dir must be non-empty")
+        return s
+
+    def remote_path_container(self) -> str:
+        """Absolute path on the replica for the checkpoint directory (same as ``remote_dir``)."""
+        return self.remote_dir
+
+
 class HealthCheckSpec(BaseModel):
     """Optional shell probe on the replica: exit code 0 means healthy (monitored on ``interval_sec``)."""
 
@@ -342,6 +383,14 @@ class ClusterSpec(BaseModel):
     health: HealthCheckSpec | None = Field(
         default=None,
         description="Optional health probe (see HealthCheckSpec); served via /quickpod/status on replicas.",
+    )
+    train: TrainSpec | None = Field(
+        default=None,
+        description=(
+            "When set, ``quickpod train`` copies checkpoints from replicas to ``train.local_dir`` "
+            "after ``run`` produces ``/workspace/quickpod-train-export.tar.gz``. "
+            "``run`` sees ``$train_remote_dir`` (bash, set in the startup script)."
+        ),
     )
 
     @field_validator("envs")

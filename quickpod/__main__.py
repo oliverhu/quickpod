@@ -33,6 +33,7 @@ from quickpod.serve_daemon_mgmt import (
 )
 from quickpod.serve_runner import run_serve
 from quickpod.spec import load_spec
+from quickpod.train_runner import run_train
 
 
 def _print_clusters_table(rows: list[dict], *, database_url: str) -> None:
@@ -131,6 +132,36 @@ def main() -> None:
         "--foreground",
         action="store_true",
         help="Run in the foreground (default: start a background daemon and exit)",
+    )
+
+    tr = sub.add_parser(
+        "train",
+        help=(
+            "Reconcile cluster, wait for training export tarball on replicas, "
+            "download via mTLS to train.local_dir from the YAML, then terminate RunPod pods "
+            "and remove the cluster from the store. Requires ``train: { remote_dir, local_dir }`` "
+            "in the spec (``remote_dir`` absolute on the container); ``run`` sees ``$train_remote_dir``."
+        ),
+    )
+    tr.add_argument("--spec", type=str, required=True, help="Path to cluster YAML")
+    tr.add_argument(
+        "--worker-wait-sec",
+        type=int,
+        default=900,
+        metavar="SEC",
+        help="Max seconds to wait for RUNNING replicas (default 900)",
+    )
+    tr.add_argument(
+        "--export-timeout-sec",
+        type=int,
+        default=7200,
+        metavar="SEC",
+        help="Max seconds to wait for /workspace/quickpod-train-export.tar.gz (default 7200)",
+    )
+    tr.add_argument(
+        "--clean-start",
+        action="store_true",
+        help="Terminate existing pods for this cluster and remove its DB row before provisioning",
     )
 
     ui = sub.add_parser(
@@ -259,6 +290,21 @@ def main() -> None:
             except RuntimeError as e:
                 print(str(e), file=sys.stderr)
                 sys.exit(2)
+        return
+
+    if args.cmd == "train":
+        try:
+            run_train(
+                os.path.abspath(args.spec),
+                key,
+                database_url=args.database_url,
+                worker_wait_sec=int(args.worker_wait_sec),
+                export_timeout_sec=int(args.export_timeout_sec),
+                clean_start=bool(args.clean_start),
+            )
+        except (RuntimeError, TimeoutError, OSError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
         return
 
     if args.cmd == "serve":

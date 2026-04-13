@@ -1,0 +1,48 @@
+# Train smoke (mTLS): ``train.remote_dir`` / ``train.local_dir`` in YAML; ``run`` uses ``$train_remote_dir``.
+#
+# Certs: scripts/gen_mtls_certs.sh examples/mtls_smoke_certs
+# Run: uv run python scripts/smoke_train_e2e.py --clean-start
+
+name: nova-train-smoke-mtls
+num_nodes: 1
+reconcile_interval_seconds: 60
+
+train:
+  remote_dir: /workspace/checkpoints
+  local_dir: ./quickpod-train-smoke-out
+
+resources:
+  compute_type: GPU
+  image: python:3.11-slim-bookworm
+  gpu: RTX3090
+  gpu_count: 1
+  ports:
+    - 8000
+  worker_api_port: 8000
+  secure_mode: true
+  cloud_type: ALL
+  zones:
+    - US-IL-1
+    - US-TX-1
+    - US-CA-1
+    - US-DE-1
+    - US-WA-1
+  container_disk_in_gb: 25
+  mtls:
+    verify_server_hostname: false
+    ca_file: mtls_smoke_certs/ca.pem
+    client_cert_file: mtls_smoke_certs/client.crt
+    client_key_file: mtls_smoke_certs/client.key
+    server_cert_file: mtls_smoke_certs/server.pem
+    server_key_file: mtls_smoke_certs/server.key
+
+envs: {}
+
+setup: |
+  apt-get update -qq && apt-get install -y -qq curl ca-certificates psmisc || true
+
+run: |
+  set -euo pipefail
+  mkdir -p "$train_remote_dir"
+  echo "quickpod-train-smoke-marker" > "$train_remote_dir/artifact.txt"
+  tar czf /workspace/quickpod-train-export.tar.gz -C "$(dirname "$train_remote_dir")" "$(basename "$train_remote_dir")"
